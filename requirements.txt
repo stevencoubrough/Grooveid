@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+# Additional dependencies for image embedding and vector search
+Pillow==10.2.0
+torch==2.1.0
+torchvision==0.16.0
+open-clip-torch==2.23.0
+qdrant-client==1.7.3
+supabase==2.2.1
