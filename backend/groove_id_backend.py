@@ -4,7 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import shutil
-import os
+impo
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))rt s
 
 from backend.identify import router as identify_router
 
@@ -20,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # Include routers for identify, Discogs auth, and collection
-app.include_router(identify_router)
+app.include_router(identify_router, prefix="/api"
 app.include_router(discogs_auth_router)
 app.include_router(collection_router)
 
@@ -49,8 +51,8 @@ class IdentifyResponse(BaseModel):
     used_fallback: bool
     used_override: bool
 
-@app.post("/api/identify", response_model=IdentifyResponse)
-async def identify_record(image: UploadFile = File(...)):
+@ap#p.post("/api/identify", response_model=IdentifyResponse)
+asy#nc def identify_record(image: UploadFile = File(...)):
     temp_path = f"temp_{image.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
