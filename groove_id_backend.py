@@ -21,6 +21,11 @@ from PIL import Image
 import torch  # type: ignore
 import torchvision.transforms as T  # type: ignore
 import open_clip  # type: ignore
+
+from backend.identify import router as identify_router
+from backend.discogs_auth import router as discogs_auth_router
+from backend.collection import router as collection_router
+
 from qdrant_client import QdrantClient  # type: ignore
 from supabase import create_client  # type: ignore
 
@@ -123,6 +128,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Include routers for vision identification and discogs auth/collection
+app.include_router(identify_router)
+app.include_router(discogs_auth_router)
+app.include_router(collection_router)
+
 
 
 @app.post("/api/identify", response_model=IdentifyResponse)
