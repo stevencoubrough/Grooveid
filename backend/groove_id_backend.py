@@ -6,10 +6,10 @@ import uvicorn
 import shutil
 import os
 
-from .identify import router as identify_router
-from .discogs_auth import router as discogs_auth_router
-from .collection import router as collection_router
+from backend.identify import router as identify_router
 
+from backend.discogs_auth import router as discogs_auth_router
+from backend.collection import router as collection_router
 app = FastAPI()
 
 app.add_middleware(
