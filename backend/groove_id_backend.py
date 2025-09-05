@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import sys
 
-# Ensure the parent directory is in sys.path so 'backend' package can be imported when executed directly
+# ensure parent directory is in sys.path so `backend` package is importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.identify import router as identify_router
@@ -20,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# include routers
 app.include_router(identify_router, prefix="/api")
 app.include_router(discogs_auth_router)
 app.include_router(collection_router)
