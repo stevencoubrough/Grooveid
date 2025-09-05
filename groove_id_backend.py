@@ -129,7 +129,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # Include routers for vision identification and discogs auth/collection
-app.include_router(identify_router), prefix="/api"
+#app.i#nclu#d_router(identify_router), prefix="/api"
+app.include_router(identify_router, prefix="/api")
 app.include_router(discogs_auth_router)
 app.include_router(collection_router)
 
