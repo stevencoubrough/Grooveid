@@ -10,3 +10,5 @@ torchvision==0.16.0
 open-clip-torch==2.23.0
 qdrant-client==1.7.3
 supabase==2.2.1
+requests
+requests-oauthlib
