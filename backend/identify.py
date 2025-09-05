@@ -191,8 +191,8 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 discogs_url=f"https://www.discogs.com/master/{master_id}",
                 note="Master match — prompt user to select a pressing",
                 score=0.60,
-            ))
-         # Fallback: search via OCR
+                # improved OCR fallback - removed stub
+# Fallback: search via OCR
     if not candidates:
         lines = ocr_lines(text_annotations)
         if lines:
