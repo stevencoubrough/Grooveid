@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pydantic
 python-multipart
+requests
+requests-oauthlib
+supabase==2.2.1
