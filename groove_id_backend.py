@@ -129,84 +129,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # Include routers for vision identification and discogs auth/collection
-app.include_router(identify_router)
+app.include_router(identify_router), prefix="/api"
 app.include_router(discogs_auth_router)
 app.include_router(collection_router)
 
 
-
-@app.post("/api/identify", response_model=IdentifyResponse)
-async def identify_record(image: UploadFile = File(...)) -> IdentifyResponse:
-    """Identify a record by its label image.
-
-    This endpoint accepts an uploaded image, computes its embedding,
-    performs a nearest-neighbour search in Qdrant, and returns record
-    metadata. If no match is found or metadata cannot be fetched,
-    appropriate HTTP errors are raised.
-
-    Args:
-        image: The uploaded image file containing a record label.
-
-    Returns:
-        An IdentifyResponse with record details and confidence score.
-    """
-    # Save the uploaded image to a temporary file on disk
-    temp_path = f"temp_{image.filename}"
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(image.file, buffer)
-
-    try:
-        # Compute embedding and search Qdrant
-        embedding = embed_image(temp_path)
-        payload = search_qdrant(embedding)
-
-        if payload is None:
-            raise HTTPException(status_code=404, detail="No matching record found.")
-
-        # Attempt to fetch full metadata from Supabase using an ID from the payload.
-        # We look for a key 'id' or 'release_id' in the payload. If not
-        # present, we assume the payload already contains all metadata.
-        record = None
-        record_id = payload.get("id") or payload.get("release_id")
-        if record_id:
-            # Query the 'records' table (adjust table name as needed)
-            response = supabase_client.table("records").select("*", count="exact").eq("id", record_id).execute()
-            if response.data:
-                record = response.data[0]
-
-        # Fallback: if record is None, use the payload directly as metadata
-        meta = record or payload
-
-        # Map keys to our response model, providing defaults for missing
-        # values. Qdrant payloads may use different naming schemes (e.g.
-        # 'artist_name' vs 'artist'). Adjust these keys as needed to
-        # match your ingestion pipeline.
-        title = meta.get("title") or meta.get("release_title") or "Unknown Title"
-        artist = meta.get("artist") or meta.get("artist_name") or "Unknown Artist"
-        label = meta.get("label") or meta.get("label_name") or "Unknown Label"
-        catalog_number = meta.get("catalog_number") or meta.get("cat_no") or ""
-        discogs_url = meta.get("discogs_url") or meta.get("discogs_link") or ""
-        confidence = meta.get("score") or meta.get("confidence") or 0.0
-        used_override = bool(meta.get("used_override", False))
-
-        return IdentifyResponse(
-            title=title,
-            artist=artist,
-            label=label,
-            catalog_number=catalog_number,
-            discogs_url=discogs_url,
-            confidence=float(confidence),
-            used_fallback=record is None,
-            used_override=used_override,
-        )
-    finally:
-        # Always remove the temporary file
-        try:
-            os.remove(temp_path)
-        except FileNotFoundError:
-            pass
-
-
+#
+@## removed stub
 if __name__ == "__main__":  # pragma: no cover
     # Only run uvicorn if this module is executed directly. When
     # deployed on Render, the start command will invoke uvicorn via
