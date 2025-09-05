@@ -6,6 +6,10 @@ import uvicorn
 import shutil
 import os
 
+from .identify import router as identify_router
+from .discogs_auth import router as discogs_auth_router
+from .collection import router as collection_router
+
 app = FastAPI()
 
 app.add_middleware(
@@ -15,6 +19,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Include routers for identify, Discogs auth, and collection
+app.include_router(identify_router)
+app.include_router(discogs_auth_router)
+app.include_router(collection_router)
+
 
 def embed_image(file_path):
     return [0.1] * 512
