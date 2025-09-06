@@ -110,9 +110,14 @@ def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
     return None
 
 def search_discogs_via_ocr(query: str) -> List[IdentifyCandidate]:
+
+            
     candidates: List[IdentifyCandidate] = []
     headers = {"User-Agent": "GrooveID/1.0 (+https://grooveid.app)"}
     params = {"q": query, "type": "release"}
+            token = os.environ.get("DISCOGS_TOKEN")
+        if token:
+            params["token"] = token
     try:
         r = requests.get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=15)
         if r.status_code == 200:
