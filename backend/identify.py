@@ -209,7 +209,6 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 query = " ".join(lines[:2])[:200]
             candidates.extend(search_discogs_via_ocr(query))
 
-
         return IdentifyResponse(candidates=candidates[:5])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
