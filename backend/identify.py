@@ -196,7 +196,6 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 discogs_url=f"https://www.discogs.com/master/{master_id}",
                 note="Master match — prompt user to select a pressing",
                 score=0.60,
-                # improved OCR fallback - removed stub
 # Fallback: search via OCR
 if not candidates:
     lines = ocr_lines(text_annotations)
@@ -204,15 +203,13 @@ if not candidates:
         # Clean each line: remove digits and hyphens but keep the remaining words
         clean_lines = []
         for ln in lines:
-            cleaned = re.sub(r"[\d\-]", "", ln).strip()
+            cleaned = re.sub(r"[\\d\\-]", "", ln).strip()
             if cleaned:
                 clean_lines.append(cleaned)
-        # Build the query from the first 3 cleaned lines, or fall back to the first two original lines
+        # Build the query from the first 3 cleaned lines or fall back to the first two original lines
         query_parts = clean_lines[:3] if clean_lines else lines[:2]
         query = " ".join(query_parts)[:200]
         if query:
             candidates.extend(search_discogs_via_ocr(query))
+    return IdentifyResponse(candidates=candidates[:5])
 
-        return IdentifyResponse(candidates=candidates[:5])
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
