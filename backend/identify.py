@@ -47,12 +47,10 @@ class IdentifyResponse(BaseModel):
 
 router = APIRouter()
 
-
 def call_vision_api(image_bytes: bytes) -> dict:
     """Call the Google Vision API with both web detection and text detection enabled."""
     if not VISION_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY is not configured")
-
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "requests": [
@@ -74,7 +72,6 @@ def call_vision_api(image_bytes: bytes) -> dict:
         )
     data = resp.json()
     return data["responses"][0]
-
 
 def parse_discogs_web_detection(web_detection: dict) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     """Parse release or master IDs from Discogs URLs returned by Vision web detection."""
@@ -113,14 +110,12 @@ def parse_discogs_web_detection(web_detection: dict) -> Tuple[Optional[int], Opt
 
     return release_id, master_id, discogs_url
 
-
 def ocr_lines(text_annotations: List[dict]) -> List[str]:
     """Extract a list of lines from the first text annotation (the full description)."""
     if not text_annotations:
         return []
     raw = text_annotations[0].get("description", "")
     return [ln.strip() for ln in raw.splitlines() if ln.strip()]
-
 
 def fetch_release_from_cache(release_id: int) -> Optional[dict]:
     """Look up a release in the Supabase discogs_cache table."""
@@ -135,13 +130,11 @@ def fetch_release_from_cache(release_id: int) -> Optional[dict]:
     )
     return data.data[0] if data.data else None
 
-
 def insert_cache_row(row: dict) -> None:
     """Upsert a row into the discogs_cache table."""
     if not supabase:
         return
     supabase.table("discogs_cache").upsert(row, on_conflict="release_id").execute()
-
 
 def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
     """Retrieve release metadata from Discogs."""
@@ -154,7 +147,6 @@ def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
     except Exception:
         pass
     return None
-
 
 def search_discogs_via_ocr(query: str) -> List[IdentifyCandidate]:
     """Perform a Discogs database search using the OCR query and return up to 5 candidates."""
@@ -200,7 +192,6 @@ def search_discogs_via_ocr(query: str) -> List[IdentifyCandidate]:
     except Exception:
         pass
     return candidates
-
 
 @router.post("/identify", response_model=IdentifyResponse)
 async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
@@ -274,22 +265,32 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 )
             )
 
-        # OCR fallback to search by text
+        # Improved OCR fallback to search by text
         if not candidates:
             lines = ocr_lines(text_annotations)
             if lines:
-                # Clean each line: remove digits and hyphens but keep words
-                clean_lines = []
+                # Clean each line: remove only punctuation except hyphens and slashes; keep digits
+                clean_lines: List[str] = []
                 for ln in lines:
-                    cleaned = re.sub(r"[\\d\\-]", "", ln).strip()
+                    cleaned = re.sub(r"[^\\w\\s\\-/]", "", ln).strip()
                     if cleaned:
                         clean_lines.append(cleaned)
 
-                # Build the query from the first 3 cleaned lines, or fall back to the first two original lines
-                query_parts = clean_lines[:3] if clean_lines else lines[:2]
-                query = " ".join(query_parts)[:200]
-                if query:
-                    candidates.extend(search_discogs_via_ocr(query))
+                queries: List[str] = []
+                if clean_lines:
+                    queries.append(" ".join(clean_lines[:3])[:200])
+                    if len(clean_lines) >= 2:
+                        queries.append(" ".join(clean_lines[:2])[:200])
+                    queries.append(clean_lines[0][:200])
+                else:
+                    queries.append(" ".join(lines[:2])[:200])
+
+                # Try each query until we get candidates
+                for query in queries:
+                    ocr_candidates = search_discogs_via_ocr(query)
+                    if ocr_candidates:
+                        candidates.extend(ocr_candidates)
+                        break
 
         return IdentifyResponse(candidates=candidates[:5])
     except Exception as exc:
