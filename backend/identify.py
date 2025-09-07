@@ -272,7 +272,7 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 # Clean each line: remove only punctuation except hyphens and slashes; keep digits
                 clean_lines: List[str] = []
                 for ln in lines:
-                    cleaned = re.sub(r"[^\\w\\s\\-/]", "", ln).strip()
+                    cleaned = re.sub(r"[^\w\s/-]", "", ln).strip()
                     if cleaned:
                         clean_lines.append(cleaned)
 
