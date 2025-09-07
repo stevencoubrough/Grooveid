@@ -198,15 +198,19 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 score=0.60,
                 # improved OCR fallback - removed stub
 # Fallback: search via OCR
-    if not candidates:
-        lines = ocr_lines(text_annotations)
-        if lines:
-            # Filter lines without digits to avoid track durations or catalog numbers
-            filtered = [ln for ln in lines if not re.search(r"\d", ln)]
-            if filtered:
-                query = " ".join(filtered[:3])[:200]
-            else:
-                query = " ".join(lines[:2])[:200]
+if not candidates:
+    lines = ocr_lines(text_annotations)
+    if lines:
+        # Clean each line: remove digits and hyphens but keep the remaining words
+        clean_lines = []
+        for ln in lines:
+            cleaned = re.sub(r"[\d\-]", "", ln).strip()
+            if cleaned:
+                clean_lines.append(cleaned)
+        # Build the query from the first 3 cleaned lines, or fall back to the first two original lines
+        query_parts = clean_lines[:3] if clean_lines else lines[:2]
+        query = " ".join(query_parts)[:200]
+        if query:
             candidates.extend(search_discogs_via_ocr(query))
 
         return IdentifyResponse(candidates=candidates[:5])
