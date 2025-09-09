@@ -6,3 +6,7 @@ requests
 requests-oauthlib
 supabase==2.2.1
 pillow>=10
+open-clip-torch>=2.24.0
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.25.0
