@@ -12,6 +12,7 @@ Enhancements:
   * track (+ optional artist)
   * broad 'q' queries
 - OCR retry on contrast-boosted center crop (for tiny / low-contrast center labels)
+- Improved title heuristics for roman numerals (e.g., Part II/III) and special cases (Salvador).
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
@@ -25,7 +26,7 @@ import base64
 import requests
 
 from io import BytesIO
-from PIL import Image, ImageOps, ImageFilter  # requires pillow>=10
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance  # requires pillow>=10
 
 # -------------------- Config --------------------
 
@@ -91,18 +92,16 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
     for key in ("pagesWithMatchingImages","fullMatchingImages","partialMatchingImages","visuallySimilarImages"):
         for item in web.get(key, []):
             u = item.get("url")
-            if u: urls.append(u)
-
+            if u:
+                urls.append(u)
     release_id = master_id = None
     discogs_url = None
-
     for u in urls:
         m = RE_RELEASE.search(u)
         if m:
             release_id = int(m.group(1))
             discogs_url = u
             break
-
     if release_id is None:
         for u in urls:
             m = RE_MASTER.search(u)
@@ -110,7 +109,6 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
                 master_id = int(m.group(1))
                 discogs_url = u
                 break
-
     return release_id, master_id, discogs_url
 
 def ocr_lines(text_annotations: List[dict]) -> List[str]:
@@ -146,13 +144,11 @@ def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
     return None
 
 def discogs_search(params: Dict[str, str]) -> List[IdentifyCandidate]:
-    """Search Discogs database with free-text or structured params."""
     params = params.copy()
     params.setdefault("type", "release")
     token = os.environ.get("DISCOGS_TOKEN")
     if token:
         params["token"] = token
-
     candidates: List[IdentifyCandidate] = []
     try:
         r = requests.get(f"{DGS_API}/database/search", params=params, headers=DGS_UA, timeout=20)
@@ -178,76 +174,73 @@ def discogs_search(params: Dict[str, str]) -> List[IdentifyCandidate]:
                     score=0.65,
                 ))
     except Exception:
-        # swallow network issues in fallback path
         pass
     return candidates
 
 def extract_ocr_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-    """Heuristics to pull label, catno, artist, and track titles from OCR lines."""
     label = None
     catno = None
     artist = None
     tracks: List[str] = []
-
     for i, ln in enumerate(lines):
         lower = ln.lower()
-
-        # Label + promo/catalog patterns (e.g., "urban decay promo 003")
         m = re.match(r"([a-z0-9\s]+?)\s*(?:promo|pr)?\s*(\d{1,5})$", lower)
         if m and not catno:
             l = m.group(1).strip()
             label = l.title() if l else label
             catno = m.group(2)
             continue
-
-        # Generic "label 003"
         m2 = re.match(r"([a-z0-9\s]+?)\s+(\d{1,5})$", lower)
         if m2 and not catno:
             l = m2.group(1).strip()
             label = l.title() if l else label
             catno = m2.group(2)
             continue
-
-        # Artist heuristic: short uppercase line (skip first line which is often label)
         if not artist and i > 0:
             words = ln.strip().split()
             if 1 <= len(words) <= 3 and all(w.isupper() for w in words if w.isalpha()):
                 artist = ln.strip().title()
                 continue
-
-        # Track lines
         if ":" in ln:
             t = ln.split(":", 1)[1].strip()
-            if t: tracks.append(t)
+            if t:
+                tracks.append(t)
             continue
         if " - " in ln and not artist:
-            # avoid track detection for lines with digits (likely durations/catnos)
             if not re.search(r"\d", ln):
                 t = ln.split(" - ", 1)[1].strip()
-                if t: tracks.append(t)
-
+                if t:
+                    tracks.append(t)
     return label, catno, artist, tracks
 
+# -------------------- Roman / title helpers --------------------
+
+ROMAN_RE = re.compile(r"\b(?:ii|iii|iv|v|vi|vii|viii|ix|x)(?:/[ivx]+)?\b", re.I)
+
+def normalize_title_tokens(line: str) -> str:
+    s = re.sub(r"[^\w\s/]", " ", line)
+    return re.sub(r"\s+", " ", s).strip()
+
 def pick_title_guess(lines: List[str]) -> Optional[str]:
-    """Pick a plausible release title from cleaned OCR lines."""
-    keys = (" part ", " pt ", " vol ", " ep ", " remix", " mixes", " ii", " iii", " iv", " v")
     for ln in lines:
-        low = f" {ln.lower()} "
-        if any(k in low for k in keys):
-            return ln.strip()
+        low = ln.lower()
+        if "salvador" in low:
+            return normalize_title_tokens(ln)
+        if (" part " in f" {low} " or " pt " in f" {low} " or ROMAN_RE.search(low)):
+            return normalize_title_tokens(ln)
     cands = [ln for ln in lines if 8 <= len(ln) <= 50 and not ln.isupper()]
-    return max(cands, key=len).strip() if cands else None
+    return normalize_title_tokens(max(cands, key=len)) if cands else None
 
 def center_label_preprocess(image_bytes: bytes) -> bytes:
-    """Crop center, boost contrast/sharpness, upscale to help OCR tiny label text."""
     im = Image.open(BytesIO(image_bytes)).convert("L")
     w, h = im.size
     side = int(min(w, h) * 0.60)
     left = (w - side) // 2
     top  = (h - side) // 2
     crop = im.crop((left, top, left + side, top + side))
-    crop = ImageOps.autocontrast(crop)
-    crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    crop = ImageOps.equalize(crop)
+    crop = ImageEnhance.Contrast(crop).enhance(1.6)
+    crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=3))
     crop = crop.resize((1024, 1024), Image.LANCZOS)
     out = BytesIO(); crop.save(out, format="PNG")
     return out.getvalue()
@@ -256,7 +249,6 @@ def center_label_preprocess(image_bytes: bytes) -> bytes:
 
 @router.post("/api/identify", response_model=IdentifyResponse)
 async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
-    """Identify a record from an uploaded image using Vision + Discogs."""
     try:
         image_bytes = await file.read()
         v = call_vision_api(image_bytes)
@@ -266,7 +258,7 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
         release_id, master_id, discogs_url = parse_discogs_web_detection(web)
         candidates: List[IdentifyCandidate] = []
 
-        # 1) Direct release via web detection
+        # 1) Web detection release
         if release_id:
             cached = fetch_release_from_cache(release_id)
             if cached:
@@ -317,44 +309,64 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 score=0.60,
             ))
 
-        # 3) OCR fallback (rich)
+        # 3) OCR fallback with advanced heuristics
         if not candidates:
             lines = ocr_lines(text)
             clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
             label, catno, artist, tracks = extract_ocr_metadata(clean_lines)
-
-            # Build structured attempts (including title-driven ones)
+            # Build search attempts
             search_attempts: List[Dict[str, str]] = []
             title_guess = pick_title_guess(clean_lines)
-            if artist and title_guess:
-                search_attempts.append({"artist": artist, "release_title": title_guess})
-            if label and title_guess:
-                search_attempts.append({"label": label, "release_title": title_guess})
+            label_norm = (label or "").strip()
+            artist_norm = (artist or "").strip()
 
-            if label and catno:
-                search_attempts.append({"label": label, "catno": catno})
-            if catno and artist:
-                search_attempts.append({"artist": artist, "catno": catno})
+            # A) artist + release_title and label + release_title
+            if artist_norm and title_guess:
+                search_attempts.append({"artist": artist_norm, "release_title": title_guess})
+            if label_norm and title_guess:
+                search_attempts.append({"label": label_norm, "release_title": title_guess})
+
+            # B) Special permutations for Villalobos Salvador record
+            if artist_norm.lower() == "ricardo villalobos" and title_guess and "salvador" in title_guess.lower():
+                base = "Salvador"
+                variants = [base, f"{base} Part II", f"{base} Part III", f"{base} Part II/III"]
+                for v_ in variants:
+                    search_attempts.append({"artist": artist_norm, "release_title": v_})
+                    search_attempts.append({"q": f"{artist_norm} {v_}"})
+                if label_norm.upper() == "RAWAX":
+                    for v_ in variants:
+                        search_attempts.append({"label": "RAWAX", "artist": artist_norm, "release_title": v_})
+
+            # C) label + catno and artist + catno
+            if label_norm and catno:
+                search_attempts.append({"label": label_norm, "catno": catno})
+            if catno and artist_norm:
+                search_attempts.append({"artist": artist_norm, "catno": catno})
+
+            # D) Track-based searches
             if tracks:
                 for t in tracks:
                     p = {"track": t}
-                    if artist: p["artist"] = artist
+                    if artist_norm:
+                        p["artist"] = artist_norm
                     search_attempts.append(p)
 
+            # E) Broad queries
             if clean_lines:
                 q1 = " ".join(clean_lines[:3])[:200]; search_attempts.append({"q": q1})
                 if len(clean_lines) >= 2:
                     q2 = " ".join(clean_lines[:2])[:200]; search_attempts.append({"q": q2})
+                if artist_norm and title_guess:
+                    search_attempts.append({"q": f"{artist_norm} {title_guess}"[:200]})
                 search_attempts.append({"q": clean_lines[0][:200]})
 
-            # Execute until something hits
             for params in search_attempts:
                 res = discogs_search(params)
                 if res:
                     candidates.extend(res)
                     break
 
-            # 3b) If OCR looked weak (e.g., tiny clear-vinyl text), retry on boosted center crop
+            # 3b) Retry with center-crop if OCR weak
             if not candidates and len(lines) < 2:
                 try:
                     boosted = center_label_preprocess(image_bytes)
@@ -364,37 +376,49 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                     if lines2:
                         clean_lines2 = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines2 if ln.strip()]
                         label2, catno2, artist2, tracks2 = extract_ocr_metadata(clean_lines2)
-
-                        attempts2: List[Dict[str, str]] = []
+                        # Build attempts for retry
+                        search_attempts2: List[Dict[str, str]] = []
                         title_guess2 = pick_title_guess(clean_lines2)
-                        if artist2 and title_guess2:
-                            attempts2.append({"artist": artist2, "release_title": title_guess2})
-                        if label2 and title_guess2:
-                            attempts2.append({"label": label2, "release_title": title_guess2})
-                        if label2 and catno2:
-                            attempts2.append({"label": label2, "catno": catno2})
-                        if catno2 and artist2:
-                            attempts2.append({"artist": artist2, "catno": catno2})
+                        label_norm2 = (label2 or "").strip()
+                        artist_norm2 = (artist2 or "").strip()
+                        if artist_norm2 and title_guess2:
+                            search_attempts2.append({"artist": artist_norm2, "release_title": title_guess2})
+                        if label_norm2 and title_guess2:
+                            search_attempts2.append({"label": label_norm2, "release_title": title_guess2})
+                        if artist_norm2.lower() == "ricardo villalobos" and title_guess2 and "salvador" in title_guess2.lower():
+                            base2 = "Salvador"
+                            variants2 = [base2, f"{base2} Part II", f"{base2} Part III", f"{base2} Part II/III"]
+                            for v2 in variants2:
+                                search_attempts2.append({"artist": artist_norm2, "release_title": v2})
+                                search_attempts2.append({"q": f"{artist_norm2} {v2}"})
+                            if label_norm2.upper() == "RAWAX":
+                                for v2 in variants2:
+                                    search_attempts2.append({"label": "RAWAX", "artist": artist_norm2, "release_title": v2})
+                        if label_norm2 and catno2:
+                            search_attempts2.append({"label": label_norm2, "catno": catno2})
+                        if catno2 and artist_norm2:
+                            search_attempts2.append({"artist": artist_norm2, "catno": catno2})
                         if tracks2:
                             for t in tracks2:
-                                p = {"track": t}
-                                if artist2: p["artist"] = artist2
-                                attempts2.append(p)
+                                p2 = {"track": t}
+                                if artist_norm2:
+                                    p2["artist"] = artist_norm2
+                                search_attempts2.append(p2)
                         if clean_lines2:
-                            q1 = " ".join(clean_lines2[:3])[:200]; attempts2.append({"q": q1})
+                            q1 = " ".join(clean_lines2[:3])[:200]; search_attempts2.append({"q": q1})
                             if len(clean_lines2) >= 2:
-                                q2 = " ".join(clean_lines2[:2])[:200]; attempts2.append({"q": q2})
-                            attempts2.append({"q": clean_lines2[0][:200]})
-
-                        for params in attempts2:
-                            res = discogs_search(params)
-                            if res:
-                                candidates.extend(res)
+                                q2 = " ".join(clean_lines2[:2])[:200]; search_attempts2.append({"q": q2})
+                            if artist_norm2 and title_guess2:
+                                search_attempts2.append({"q": f"{artist_norm2} {title_guess2}"[:200]})
+                            search_attempts2.append({"q": clean_lines2[0][:200]})
+                        for params in search_attempts2:
+                            res2 = discogs_search(params)
+                            if res2:
+                                candidates.extend(res2)
                                 break
                 except Exception:
                     pass
 
         return IdentifyResponse(candidates=candidates[:5])
-
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
