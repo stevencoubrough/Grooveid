@@ -407,7 +407,85 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
             ))
 
         # 3) OCR fallback with structured passes (keeps digits/hyphens)
-        if not candidates:
+        
+                # Upgraded OCR fallback (track/catno voting)
+        raw_lines = ocr_lines(text)
+        # keep a plain-cleaned copy for structured guesses
+        clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in raw_lines if ln.strip()]
+        # denoised copy for track/catno extraction
+        denoised = denoise_lines(clean_lines)
+
+        label, catno, artist, tracks_meta = extract_ocr_metadata(clean_lines)
+        tracks = extract_tracks(denoised)
+        lbl_from_cat, cat_from_cat = find_label_catno(denoised)
+        if not label and lbl_from_cat:
+            label = lbl_from_cat
+        if not catno and cat_from_cat:
+            catno = cat_from_cat
+
+        search_attempts: List[dict[str, str]] = []
+
+        # Try to pick a plausible title line
+        def guess_title(ls: list[str]) -> Optional[str]:
+            keys = (" part ", " pt ", " vol ", " ep ", " remix", " mixes", " ii", " iii", " iv", " v")
+            for l in ls:
+                if any(k in f" {l.lower()} " for k in keys):
+                    return l
+            cands = [l for l in ls if 8 <= len(l) <= 50 and not l.isupper()]
+            return max(cands, key=len) if cands else None
+
+        title_guess = guess_title(clean_lines)
+
+        # Structured attempts first
+        if artist and title_guess:
+            search_attempts.append({"artist": artist, "release_title": title_guess})
+        if label and title_guess:
+            search_attempts.append({"label": label, "release_title": title_guess})
+        if label and catno:
+            search_attempts.append({"label": label, "catno": catno})
+        if artist and catno:
+            search_attempts.append({"artist": artist, "catno": catno})
+
+        # If we see multiple track titles but no artist/label, use track voting
+        if tracks and not artist and not label:
+            voted = vote_releases_by_tracks(tracks)
+            for rid in voted:
+                rel = fetch_discogs_release_json(rid)
+                if rel:
+                    candidates.append(candidates_from_release_json(rel, "track_vote", None, 0.92))
+            # still nothing? add direct per-track results (lower score)
+            if not candidates:
+                for t in tracks[:4]:
+                    for rid in discogs_search_track(t, limit=6):
+                        rel = fetch_discogs_release_json(rid)
+                        if rel:
+                            candidates.append(candidates_from_release_json(rel, "track_search", None, 0.70))
+
+        # Broad fallbacks (make them truly last)
+        if not candidates and clean_lines:
+            q1 = " ".join(clean_lines[:3])[:200]
+            q2 = " ".join(clean_lines[:2])[:200] if len(clean_lines) >= 2 else ""
+            q3 = clean_lines[0][:200]
+            for q in filter(None, (q1, q2, q3)):
+                search_attempts.append({"q": q})
+
+        # Run the queued searches
+        ricardo_hits: List[IdentifyCandidate] = []
+        other_hits: List[IdentifyCandidate] = []
+        for params in search_attempts:
+            res = discogs_search(params)
+            if not res:
+                continue
+            for c in res:
+                a = (c.artist or "").lower()
+                if artist and artist.lower() in a:
+                    ricardo_hits.append(c)
+                else:
+                    other_hits.append(c)
+            if ricardo_hits:
+                break
+        candidates.extend(ricardo_hits or other_hits)
+if not candidates:
             lines = ocr_lines(text)
             clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
             label, catno, artist, tracks = extract_ocr_metadata(clean_lines)
