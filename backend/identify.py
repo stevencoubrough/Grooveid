@@ -236,6 +236,126 @@ def extract_ocr_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str]
             if t: tracks.append(t)
     return label, catno, artist, tracks
 
+# ----------- New helpers for noise filtering and track-based search ---------
+# Patterns to remove noise tokens from OCR lines. This helps avoid common
+# words like "Side A" or "Volume 1" from polluting Discogs queries.
+NOISE_PATTERNS = [
+    r"\bside\s*[ab]\b",                # Side A / Side B
+    r"\bvol(?:ume)?\s*#?\d+\b",        # vol 1 / volume 1
+    r"\b[a-d]\d\b",                    # a1 / b2, etc.
+    r"\bfor\s+promotional\s+use\s+only\b",
+]
+
+def denoise_lines(lines: List[str]) -> List[str]:
+    """Remove common noise phrases and punctuation from OCR lines.
+    Keeps letters, digits, spaces, hyphens and slashes.
+    """
+    import re
+    out: List[str] = []
+    for ln in lines:
+        low = ln.lower()
+        for pat in NOISE_PATTERNS:
+            low = re.sub(pat, " ", low)
+        # strip unwanted characters except letters/digits/space/hyphen/slash
+        low = re.sub(r"[^\w\s/-]", " ", low)
+        # collapse whitespace and trim separators
+        low = re.sub(r"\s+", " ", low).strip(" -_\t")
+        if low:
+            out.append(low)
+    return out
+
+def extract_tracks(clean_lines: List[str]) -> List[str]:
+    """Extract plausible track names from denoised lines.
+    Track names should be of moderate length and contain letters.
+    """
+    import re
+    tracks: List[str] = []
+    for ln in clean_lines:
+        # split on separators to catch multi-track lines
+        parts = [p.strip() for p in re.split(r"[;/|]", ln)]
+        for p in parts:
+            # require some letters and a moderate length
+            if 4 <= len(p) <= 48 and re.search(r"[a-z]", p):
+                candidate = p.title()
+                # avoid starting with "Side " or "Volume "
+                if not candidate.startswith(("Side ", "Volume ")) and candidate not in tracks:
+                    tracks.append(candidate)
+    # limit to a handful of tracks to avoid spamming the API
+    return tracks[:6]
+
+def find_label_catno(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Detect compact catalogue numbers (e.g. TRON001 or TRON 001).
+    Returns a tuple of (label, catno) or (None, None) if not found.
+    """
+    import re
+    for ln in lines:
+        m = re.search(r"\b([A-Z]{3,})[- ]?(\d{1,5})\b", ln.upper())
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+    return None, None
+
+def discogs_search_track(track: str, limit: int = 8) -> List[int]:
+    """Perform a track-based search on Discogs and return a list of release IDs.
+    Uses the database search endpoint with the track parameter.
+    """
+    params: Dict[str, str] = {"track": track, "type": "release"}
+    tok = os.environ.get("DISCOGS_TOKEN")
+    if tok:
+        params["token"] = tok
+    try:
+        r = requests.get(f"{DGS_API}/database/search", headers=DGS_UA, params=params, timeout=20)
+        if r.status_code != 200:
+            return []
+        ids: List[int] = []
+        for it in r.json().get("results", [])[:limit]:
+            res_url = it.get("resource_url", "")
+            if "/releases/" in res_url:
+                try:
+                    ids.append(int(res_url.rstrip("/").split("/")[-1]))
+                except Exception:
+                    pass
+        return ids
+    except Exception:
+        return []
+
+def vote_releases_by_tracks(tracks: List[str]) -> List[int]:
+    """Vote for releases based on multiple track searches.
+    Each track contributes one vote to every release that appears in its search results.
+    Releases are returned sorted by vote count descending.
+    """
+    from collections import Counter
+    c: Counter[int] = Counter()
+    for t in tracks:
+        for rid in discogs_search_track(t):
+            c[rid] += 1
+    # sort by vote count descending then by release ID ascending
+    return [rid for rid, _ in c.most_common(10)]
+
+def candidate_from_release_json(rel: dict, source: str, score: float) -> IdentifyCandidate:
+    """Construct an IdentifyCandidate from a Discogs release JSON.
+    Includes key metadata like artist, title, label, year and cover.
+    """
+    try:
+        rid = int(rel.get("id", 0) or 0)
+    except Exception:
+        rid = None
+    discogs_url = rel.get("uri") or (f"https://www.discogs.com/release/{rid}" if rid else None)
+    artist = ", ".join(a.get("name", "") for a in rel.get("artists", [])).strip() or None
+    title = rel.get("title")
+    label = ", ".join(l.get("name", "") for l in rel.get("labels", [])).strip() or None
+    year = str(rel.get("year", "")) if rel.get("year") is not None else None
+    cover_url = rel.get("thumb") or ((rel.get("images") or [{}])[0].get("uri") if rel.get("images") else None)
+    return IdentifyCandidate(
+        source=source,
+        release_id=rid,
+        discogs_url=discogs_url,
+        artist=artist,
+        title=title,
+        label=label,
+        year=year,
+        cover_url=cover_url,
+        score=score,
+    )
 # -------------------- Tiny URL→vector SQLite cache --------------------
 def _db():
     conn = sqlite3.connect(EMBED_CACHE_PATH)
@@ -406,93 +526,44 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 score=0.60,
             ))
 
-        # 3) OCR fallback with structured passes (keeps digits/hyphens)
-        
-                # Upgraded OCR fallback (track/catno voting)
-        raw_lines = ocr_lines(text)
-        # keep a plain-cleaned copy for structured guesses
-        clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in raw_lines if ln.strip()]
-        # denoised copy for track/catno extraction
-        denoised = denoise_lines(clean_lines)
+        # 3) OCR fallback with enhanced logic
+        if not candidates:
+            # Get OCR lines and build clean + denoised versions
+            raw_lines = ocr_lines(text)
+            clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in raw_lines if ln.strip()]
+            denoised = denoise_lines(clean_lines)
 
-        label, catno, artist, tracks_meta = extract_ocr_metadata(clean_lines)
-        tracks = extract_tracks(denoised)
-        lbl_from_cat, cat_from_cat = find_label_catno(denoised)
-        if not label and lbl_from_cat:
-            label = lbl_from_cat
-        if not catno and cat_from_cat:
-            catno = cat_from_cat
+            # Extract metadata via legacy heuristics
+            label, catno, artist, tracks_meta = extract_ocr_metadata(clean_lines)
+            # Extract tracks via denoised heuristics
+            tracks = extract_tracks(denoised)
+            # Robustly detect compact catno / label patterns
+            lbl_from_cat, cat_from_cat = find_label_catno(denoised)
+            if not label and lbl_from_cat:
+                label = lbl_from_cat
+            if not catno and cat_from_cat:
+                catno = cat_from_cat
 
-        search_attempts: List[dict[str, str]] = []
-
-        # Try to pick a plausible title line
-        def guess_title(ls: list[str]) -> Optional[str]:
-            keys = (" part ", " pt ", " vol ", " ep ", " remix", " mixes", " ii", " iii", " iv", " v")
-            for l in ls:
-                if any(k in f" {l.lower()} " for k in keys):
-                    return l
-            cands = [l for l in ls if 8 <= len(l) <= 50 and not l.isupper()]
-            return max(cands, key=len) if cands else None
-
-        title_guess = guess_title(clean_lines)
-
-        # Structured attempts first
-        if artist and title_guess:
-            search_attempts.append({"artist": artist, "release_title": title_guess})
-        if label and title_guess:
-            search_attempts.append({"label": label, "release_title": title_guess})
-        if label and catno:
-            search_attempts.append({"label": label, "catno": catno})
-        if artist and catno:
-            search_attempts.append({"artist": artist, "catno": catno})
-
-        # If we see multiple track titles but no artist/label, use track voting
-        if tracks and not artist and not label:
-            voted = vote_releases_by_tracks(tracks)
-            for rid in voted:
-                rel = fetch_discogs_release_json(rid)
-                if rel:
-                    candidates.append(candidates_from_release_json(rel, "track_vote", None, 0.92))
-            # still nothing? add direct per-track results (lower score)
-            if not candidates:
-                for t in tracks[:4]:
-                    for rid in discogs_search_track(t, limit=6):
-                        rel = fetch_discogs_release_json(rid)
-                        if rel:
-                            candidates.append(candidates_from_release_json(rel, "track_search", None, 0.70))
-
-        # Broad fallbacks (make them truly last)
-        if not candidates and clean_lines:
-            q1 = " ".join(clean_lines[:3])[:200]
-            q2 = " ".join(clean_lines[:2])[:200] if len(clean_lines) >= 2 else ""
-            q3 = clean_lines[0][:200]
-            for q in filter(None, (q1, q2, q3)):
-                search_attempts.append({"q": q})
-
-        # Run the queued searches
-        ricardo_hits: List[IdentifyCandidate] = []
-        other_hits: List[IdentifyCandidate] = []
-        for params in search_attempts:
-            res = discogs_search(params)
-            if not res:
-                continue
-            for c in res:
-                a = (c.artist or "").lower()
-                if artist and artist.lower() in a:
-                    ricardo_hits.append(c)
-                else:
-                    other_hits.append(c)
-            if ricardo_hits:
-                break
-        candidates.extend(ricardo_hits or other_hits)
-if not candidates:
-            lines = ocr_lines(text)
-            clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
-            label, catno, artist, tracks = extract_ocr_metadata(clean_lines)
+            # Always attempt track-based voting if we detect multiple track names.
+            # This helps when OCR extracts both artist/label and track names but the primary
+            # structured search does not yield correct results. Voting across track matches
+            # tends to surface the correct release when multiple track names co-occur on a record.
+            if len(tracks) >= 2:
+                try:
+                    voted_ids = vote_releases_by_tracks(tracks)
+                    for rid in voted_ids:
+                        # avoid duplicates: skip if release already in candidates
+                        if rid and all((c.release_id != rid for c in candidates)):
+                            rel = fetch_discogs_release_json(rid)
+                            if rel:
+                                candidates.append(candidate_from_release_json(rel, "track_vote", 0.90))
+                except Exception:
+                    # Swallow any errors to avoid breaking fallback
+                    pass
 
             search_attempts: List[Dict[str,str]] = []
 
-            # Try to pick a plausible title line
+            # Try to pick a plausible title line (unchanged logic)
             def guess_title(ls: List[str]) -> Optional[str]:
                 keys = (" part ", " pt ", " vol ", " ep ", " remix", " mixes", " ii", " iii", " iv", " v")
                 for l in ls:
@@ -511,31 +582,49 @@ if not candidates:
                 search_attempts.append({"label": label, "catno": catno})
             if artist and catno:
                 search_attempts.append({"artist": artist, "catno": catno})
-            if tracks:
-                for t in tracks:
-                    p = {"track": t}
-                    if artist: p["artist"] = artist
-                    search_attempts.append(p)
 
-            # Broad fallbacks
-            if clean_lines:
-                search_attempts.append({"q": " ".join(clean_lines[:3])[:200]})
-                if len(clean_lines) >= 2:
-                    search_attempts.append({"q": " ".join(clean_lines[:2])[:200]})
-                search_attempts.append({"q": clean_lines[0][:200]})
+            # Track-only voting: when we have multiple track names but no clear artist/label
+            if tracks and not artist and not label:
+                # Vote across track search results
+                voted_ids = vote_releases_by_tracks(tracks)
+                for rid in voted_ids:
+                    rel = fetch_discogs_release_json(rid)
+                    if rel:
+                        candidates.append(candidate_from_release_json(rel, "track_vote", 0.92))
+                # If still empty, include direct per-track search results
+                if not candidates:
+                    for t in tracks[:4]:
+                        for rid in discogs_search_track(t, limit=6):
+                            rel = fetch_discogs_release_json(rid)
+                            if rel:
+                                candidates.append(candidate_from_release_json(rel, "track_search", 0.70))
 
+            # Broad fallbacks only if no candidates yet (use last resort)
+            if not candidates and clean_lines:
+                q_parts: List[str] = []
+                if clean_lines:
+                    q_parts.append(" ".join(clean_lines[:3])[:200])
+                    if len(clean_lines) >= 2:
+                        q_parts.append(" ".join(clean_lines[:2])[:200])
+                    q_parts.append(clean_lines[0][:200])
+                for q in q_parts:
+                    search_attempts.append({"q": q})
+
+            # Execute search attempts
             ricardo_hits: List[IdentifyCandidate] = []
             other_hits:   List[IdentifyCandidate] = []
             for params in search_attempts:
                 res = discogs_search(params)
-                if not res: continue
+                if not res:
+                    continue
                 for c in res:
                     a = (c.artist or "").lower()
                     if artist and artist.lower() in a:
                         ricardo_hits.append(c)
                     else:
                         other_hits.append(c)
-                if ricardo_hits: break
+                if ricardo_hits:
+                    break
             candidates.extend(ricardo_hits or other_hits)
 
         # 4) Visual re-rank (CLIP) when we have >=2 candidates
