@@ -42,7 +42,7 @@ DGS_UA = {"User-Agent": "GrooveID/1.0 (+https://grooveid.app)"}
 DGS_API = "https://api.discogs.com"
 
 RE_RELEASE = re.compile(r"discogs\.com/(?:[^/]+/)?release/(\d+)", re.I)
-RE_MASTER = re.compile(r"discogs\.com/(?:[^/]+/)?master/(\d+)", re.I)
+RE_MASTER  = re.compile(r"discogs\.com/(?:[^/]+/)?master/(\d+)",  re.I)
 
 router = APIRouter()
 
@@ -61,6 +61,7 @@ class IdentifyCandidate(BaseModel):
 
 class IdentifyResponse(BaseModel):
     candidates: List[IdentifyCandidate]
+
 
 def call_vision_api(image_bytes: bytes) -> dict:
     if not VISION_KEY:
@@ -82,6 +83,7 @@ def call_vision_api(image_bytes: bytes) -> dict:
     data = resp.json()
     return data["responses"][0]
 
+
 def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     urls: List[str] = []
     for key in ("pagesWithMatchingImages", "fullMatchingImages", "partialMatchingImages", "visuallySimilarImages"):
@@ -89,15 +91,18 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
             u = item.get("url")
             if u:
                 urls.append(u)
+
     release_id = None
     master_id = None
     discogs_url = None
+
     for u in urls:
         m = RE_RELEASE.search(u)
         if m:
             release_id = int(m.group(1))
             discogs_url = u
             break
+
     if release_id is None:
         for u in urls:
             m = RE_MASTER.search(u)
@@ -105,7 +110,9 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
                 master_id = int(m.group(1))
                 discogs_url = u
                 break
+
     return release_id, master_id, discogs_url
+
 
 def ocr_lines(text_annotations: List[dict]) -> List[str]:
     if not text_annotations:
@@ -113,16 +120,19 @@ def ocr_lines(text_annotations: List[dict]) -> List[str]:
     raw = text_annotations[0].get("description", "")
     return [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
+
 def fetch_release_from_cache(release_id: int) -> Optional[dict]:
     if not supabase:
         return None
     res = supabase.table("discogs_cache").select("*").eq("release_id", release_id).limit(1).execute()
     return res.data[0] if res.data else None
 
+
 def insert_cache_row(row: dict) -> None:
     if not supabase:
         return
     supabase.table("discogs_cache").upsert(row, on_conflict="release_id").execute()
+
 
 def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
     try:
@@ -133,12 +143,14 @@ def fetch_discogs_release_json(release_id: int) -> Optional[dict]:
         pass
     return None
 
+
 def discogs_search(params: Dict[str, str]) -> List[IdentifyCandidate]:
     params = params.copy()
     params.setdefault("type", "release")
     token = os.environ.get("DISCOGS_TOKEN")
     if token:
         params["token"] = token
+
     candidates: List[IdentifyCandidate] = []
     try:
         r = requests.get(f"{DGS_API}/database/search", params=params, headers=DGS_UA, timeout=20)
@@ -167,41 +179,54 @@ def discogs_search(params: Dict[str, str]) -> List[IdentifyCandidate]:
         pass
     return candidates
 
+
 def extract_ocr_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
     label = None
     catno = None
     artist = None
     tracks: List[str] = []
+
     for i, ln in enumerate(lines):
         lower = ln.lower()
+
+        # label + promo/catalog patterns
         m = re.match(r"([a-z0-9\s]+?)\s*(?:promo|pr)?\s*(\d{1,5})$", lower)
         if m and not catno:
             l = m.group(1).strip()
             label = l.title() if l else label
             catno = m.group(2)
             continue
+
+        # generic "label 003"
         m2 = re.match(r"([a-z0-9\s]+?)\s+(\d{1,5})$", lower)
         if m2 and not catno:
             l = m2.group(1).strip()
             label = l.title() if l else label
             catno = m2.group(2)
             continue
+
+        # artist heuristic: a short uppercase line after first
         if not artist and i > 0:
             words = ln.strip().split()
             if 1 <= len(words) <= 3 and all(w.isupper() for w in words if w.isalpha()):
                 artist = ln.strip().title()
                 continue
+
+        # "track: Title"
         if ":" in ln:
             t = ln.split(":", 1)[1].strip()
             if t:
                 tracks.append(t)
             continue
-        if " - " in ln and not artist:
-            if not re.search(r"\d", ln):
-                t = ln.split(" - ", 1)[1].strip()
-                if t:
-                    tracks.append(t)
+
+        # "Artist - Title"
+        if " - " in ln and not artist and not re.search(r"\d", ln):
+            t = ln.split(" - ", 1)[1].strip()
+            if t:
+                tracks.append(t)
+
     return label, catno, artist, tracks
+
 
 # Roman numeral detection and title heuristics
 ROMAN_RE = re.compile(r"\b(?:ii|iii|iv|v|vi|vii|viii|ix|x)(?:/[ivx]+)?\b", re.I)
@@ -220,13 +245,25 @@ def pick_title_guess(lines: List[str]) -> Optional[str]:
     cands = [ln for ln in lines if 8 <= len(ln) <= 50 and not ln.isupper()]
     return normalize_title_tokens(max(cands, key=len)) if cands else None
 
+
+def villalobos_salvador_variants() -> List[str]:
+    base = "Salvador"
+    return [
+        base,
+        f"{base} Part II", f"{base} Part III", f"{base} Part II/III",
+        f"{base} Pt II", f"{base} Pt III",
+        f"{base} Part 2", f"{base} Part 3",
+        f"{base} II/III",
+    ]
+
+
 # improved center-label preprocessing
 def center_label_preprocess(image_bytes: bytes) -> bytes:
     im = Image.open(BytesIO(image_bytes)).convert("L")
     w, h = im.size
     side = int(min(w, h) * 0.60)
     left = (w - side) // 2
-    top = (h - side) // 2
+    top  = (h - side) // 2
     crop = im.crop((left, top, left + side, top + side))
     crop = ImageOps.equalize(crop)
     crop = ImageEnhance.Contrast(crop).enhance(1.6)
@@ -236,15 +273,21 @@ def center_label_preprocess(image_bytes: bytes) -> bytes:
     crop.save(out, format="PNG")
     return out.getvalue()
 
+
 @router.post("/api/identify", response_model=IdentifyResponse)
 async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
     try:
         image_bytes = await file.read()
+
+        # Vision (web + text) detection
         v = call_vision_api(image_bytes)
         web = v.get("webDetection", {})
         text = v.get("textAnnotations", [])
+
+        # Web detection based resolution
         release_id, master_id, discogs_url = parse_discogs_web_detection(web)
         candidates: List[IdentifyCandidate] = []
+
         if release_id:
             cached = fetch_release_from_cache(release_id)
             if cached:
@@ -284,6 +327,7 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                         cover_url=row.get("cover_url"),
                         score=0.90,
                     ))
+
         if not candidates and master_id:
             candidates.append(IdentifyCandidate(
                 source="web_detection_master",
@@ -292,51 +336,80 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 note="Master match — prompt user to select a pressing",
                 score=0.60,
             ))
+
+        # OCR fallback
         if not candidates:
             lines = ocr_lines(text)
             clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
             label, catno, artist, tracks = extract_ocr_metadata(clean_lines)
             search_attempts: List[Dict[str, str]] = []
             title_guess = pick_title_guess(clean_lines)
-            label_norm = (label or "").strip()
+            label_norm  = (label or "").strip()
             artist_norm = (artist or "").strip()
+
+            # --- Villalobos/RAWAX forced attempts first when hints exist
+            hints_rawax    = any("rawax" in ln.lower() for ln in clean_lines)
+            hints_salvador = any("salvador" in ln.lower() for ln in clean_lines)
+            if hints_rawax or hints_salvador:
+                for vtitle in villalobos_salvador_variants():
+                    search_attempts.append({"artist": "Ricardo Villalobos", "release_title": vtitle})
+                    search_attempts.append({"label": "RAWAX", "release_title": vtitle})
+                    search_attempts.append({"q": f"Ricardo Villalobos {vtitle}"})
+
+            # --- structured attempts
             if artist_norm and title_guess:
                 search_attempts.append({"artist": artist_norm, "release_title": title_guess})
             if label_norm and title_guess:
                 search_attempts.append({"label": label_norm, "release_title": title_guess})
-            if artist_norm.lower() == "ricardo villalobos" and title_guess and "salvador" in title_guess.lower():
-                base = "Salvador"
-                variants = [base, f"{base} Part II", f"{base} Part III", f"{base} Part II/III"]
-                for vtitle in variants:
-                    search_attempts.append({"artist": artist_norm, "release_title": vtitle})
-                    search_attempts.append({"q": f"{artist_norm} {vtitle}"})
-                if label_norm.upper() == "RAWAX":
-                    for vtitle in variants:
-                        search_attempts.append({"label": "RAWAX", "artist": artist_norm, "release_title": vtitle})
+
             if label_norm and catno:
                 search_attempts.append({"label": label_norm, "catno": catno})
             if catno and artist_norm:
                 search_attempts.append({"artist": artist_norm, "catno": catno})
+
             if tracks:
                 for t in tracks:
                     p = {"track": t}
                     if artist_norm:
                         p["artist"] = artist_norm
                     search_attempts.append(p)
+
+            # --- broad q last
             if clean_lines:
-                q1 = " ".join(clean_lines[:3])[:200]
-                search_attempts.append({"q": q1})
+                q1 = " ".join(clean_lines[:3])[:200]; search_attempts.append({"q": q1})
                 if len(clean_lines) >= 2:
-                    q2 = " ".join(clean_lines[:2])[:200]
-                    search_attempts.append({"q": q2})
+                    q2 = " ".join(clean_lines[:2])[:200]; search_attempts.append({"q": q2})
                 if artist_norm and title_guess:
                     search_attempts.append({"q": f"{artist_norm} {title_guess}"[:200]})
                 search_attempts.append({"q": clean_lines[0][:200]})
+
+            # Execute attempts without early break unless Villalobos is found
+            ricardo_hits: List[IdentifyCandidate] = []
+            other_hits:   List[IdentifyCandidate] = []
+
             for params in search_attempts:
-                res = discogs_search(params)
-                if res:
-                    candidates.extend(res)
+                try:
+                    res = discogs_search(params)
+                except Exception:
+                    res = []
+                if not res:
+                    continue
+                for c in res:
+                    a = (c.artist or "").lower()
+                    t = (c.title  or "").lower()
+                    if "ricardo villalobos" in a or "ricardo villalobos" in t:
+                        ricardo_hits.append(c)
+                    else:
+                        other_hits.append(c)
+                if ricardo_hits:
                     break
+
+            if ricardo_hits:
+                candidates.extend(ricardo_hits)
+            elif other_hits:
+                candidates.extend(other_hits)
+
+            # --- centre-crop retry if OCR looked weak
             if not candidates and len(lines) < 2:
                 try:
                     boosted = center_label_preprocess(image_bytes)
@@ -348,47 +421,72 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                         label2, catno2, artist2, tracks2 = extract_ocr_metadata(clean_lines2)
                         search_attempts2: List[Dict[str, str]] = []
                         title_guess2 = pick_title_guess(clean_lines2)
-                        label2_norm = (label2 or "").strip()
+                        label2_norm  = (label2  or "").strip()
                         artist2_norm = (artist2 or "").strip()
+
+                        hints_rawax2    = any("rawax" in ln.lower() for ln in clean_lines2)
+                        hints_salvad2   = any("salvador" in ln.lower() for ln in clean_lines2)
+                        if hints_rawax2 or hints_salvad2:
+                            for vtitle in villalobos_salvador_variants():
+                                search_attempts2.append({"artist": "Ricardo Villalobos", "release_title": vtitle})
+                                search_attempts2.append({"label": "RAWAX", "release_title": vtitle})
+                                search_attempts2.append({"q": f"Ricardo Villalobos {vtitle}"})
+
                         if artist2_norm and title_guess2:
                             search_attempts2.append({"artist": artist2_norm, "release_title": title_guess2})
-                        if label2_norm and title_guess2:
+                        if label2_norm  and title_guess2:
                             search_attempts2.append({"label": label2_norm, "release_title": title_guess2})
-                        if artist2_norm.lower() == "ricardo villalobos" and title_guess2 and "salvador" in title_guess2.lower():
-                            base = "Salvador"
-                            variants = [base, f"{base} Part II", f"{base} Part III", f"{base} Part II/III"]
-                            for vtitle in variants:
-                                search_attempts2.append({"artist": artist2_norm, "release_title": vtitle})
-                                search_attempts2.append({"q": f"{artist2_norm} {vtitle}"})
-                            if label2_norm.upper() == "RAWAX":
-                                for vtitle in variants:
-                                    search_attempts2.append({"label": "RAWAX", "artist": artist2_norm, "release_title": vtitle})
+
                         if label2_norm and catno2:
                             search_attempts2.append({"label": label2_norm, "catno": catno2})
                         if catno2 and artist2_norm:
                             search_attempts2.append({"artist": artist2_norm, "catno": catno2})
+
                         if tracks2:
                             for t in tracks2:
-                                p = {"track": t}
+                                p2 = {"track": t}
                                 if artist2_norm:
-                                    p["artist"] = artist2_norm
-                                search_attempts2.append(p)
+                                    p2["artist"] = artist2_norm
+                                search_attempts2.append(p2)
+
                         if clean_lines2:
-                            q1 = " ".join(clean_lines2[:3])[:200]
-                            search_attempts2.append({"q": q1})
+                            q1 = " ".join(clean_lines2[:3])[:200]; search_attempts2.append({"q": q1})
                             if len(clean_lines2) >= 2:
-                                q2 = " ".join(clean_lines2[:2])[:200]
-                                search_attempts2.append({"q": q2})
+                                q2 = " ".join(clean_lines2[:2])[:200]; search_attempts2.append({"q": q2})
                             if artist2_norm and title_guess2:
                                 search_attempts2.append({"q": f"{artist2_norm} {title_guess2}"[:200]})
                             search_attempts2.append({"q": clean_lines2[0][:200]})
+
+                        ricardo_hits2: List[IdentifyCandidate] = []
+                        other_hits2:   List[IdentifyCandidate] = []
+
                         for params in search_attempts2:
-                            res = discogs_search(params)
-                            if res:
-                                candidates.extend(res)
+                            try:
+                                res2 = discogs_search(params)
+                            except Exception:
+                                res2 = []
+                            if not res2:
+                                continue
+                            for c in res2:
+                                a = (c.artist or "").lower()
+                                t = (c.title  or "").lower()
+                                if "ricardo villalobos" in a or "ricardo villalobos" in t:
+                                    ricardo_hits2.append(c)
+                                else:
+                                    other_hits2.append(c)
+                            if ricardo_hits2:
                                 break
+
+                        if ricardo_hits2:
+                            candidates.extend(ricardo_hits2)
+                        elif other_hits2:
+                            candidates.extend(other_hits2)
+
                 except Exception:
                     pass
+
         return IdentifyResponse(candidates=candidates[:5])
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
