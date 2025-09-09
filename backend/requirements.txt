@@ -5,3 +5,4 @@ python-multipart
 requests
 requests-oauthlib
 supabase==2.2.1
+pillow>=10
