@@ -361,85 +361,294 @@ def discogs_search(params:Dict[str,str])->List[IdentifyCandidate]:
     
     return out
 
-# ---------- Improved OCR metadata extraction ----------
-def extract_ocr_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-    """Improved metadata extraction with fuzzy matching"""
+# ---------- GENERAL OCR metadata extraction ----------
+def extract_general_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
+    """General metadata extraction that works for any record label"""
     label = catno = artist = None
     tracks = []
     
-    logger.info(f"Extracting metadata from {len(lines)} lines")
+    logger.info(f"General extraction from {len(lines)} lines: {lines}")
     
-    for i, ln in enumerate(lines):
-        lower = ln.lower().strip()
-        original = ln.strip()
-        
-        # Flexible catalog number patterns
-        patterns = [
-            r'([a-z]{2,8})\s*[-\s]*(\d{2,5})',
-            r'([a-z]{3,8})\s*([0-9]{3})',
-            r'([a-z]+)\s+vol\.?\s*(\d+)',
-            r'([a-z]+)\s+revolta\s+vol\.?\s*(\d+)',
+    all_text = ' '.join(lines).lower()
+    
+    # General label + catalog number patterns (works for any label)
+    label_catno_patterns = [
+        r'([a-z]{3,8})\s*(\d{3})',           # LABEL001, ACID123, WARP045
+        r'([a-z]{3,8})\s+(\d{3})',           # LABEL 001, ACID 123  
+        r'([a-z]{3,8})-(\d{3})',             # LABEL-001, ACID-123
+        r'([a-z]{3,8})\s*-\s*(\d{3})',       # LABEL - 001
+        r'([a-z]{2,8})\s+(\d{2,4})',         # LABEL 01, LABEL 1234
+        r'([a-z]{3,8})(\d{3})',              # LABEL001 (no space)
+    ]
+    
+    for pattern in label_catno_patterns:
+        m = re.search(pattern, all_text)
+        if m:
+            potential_label = m.group(1).upper()
+            potential_catno = m.group(2).zfill(3)  # Pad to 001 format
+            
+            # Filter out common words that aren't labels
+            excluded_words = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM']
+            if potential_label not in excluded_words and len(potential_label) >= 3:
+                label = potential_label
+                catno = potential_catno
+                logger.info(f"Found label/catno pattern: {label} {catno}")
+                break
+    
+    # Look for volume patterns (works for Vol 1, Volume 2, etc.)
+    if not catno:
+        volume_patterns = [
+            r'vol\.?\s*(\d+)',               # Vol 1, Vol. 1
+            r'volume\s+(\d+)',               # Volume 1
+            r'v\.?\s*(\d+)',                 # V1, V. 1
+            r'part\s+(\d+)',                 # Part 1
+            r'ep\s*(\d+)',                   # EP 1
         ]
         
-        for pattern in patterns:
-            m = re.search(pattern, lower)
-            if m and not catno:
-                potential_label = m.group(1).title()
-                potential_catno = m.group(2).zfill(3)
-                
-                if (len(potential_label) >= 3 and 
-                    (potential_label.upper() in ['TRON', 'ACID', 'TECH', 'HOUSE', 'DEEP', 'WARP', 'NINJA'] or 
-                     any(word in potential_label.lower() for word in ['records', 'music', 'recordings']))):
-                    label = potential_label
-                    catno = potential_catno
-                    logger.info(f"Found label/catno: {label} {catno}")
-                    break
-        
-        # Standalone catalog numbers
-        if not catno:
-            catno_patterns = [
-                r'^00[1-9]$',
-                r'^[0-9]{3}$',
-                r'^vol\.?\s*(\d+)$',
-            ]
-            for pattern in catno_patterns:
-                m = re.search(pattern, lower)
-                if m:
-                    catno = m.group(1).zfill(3) if 'vol' in pattern else lower.zfill(3)
-                    logger.info(f"Found standalone catno: {catno}")
-                    break
-        
-        # Artist detection
-        if not artist and i < len(lines) * 0.6:
-            words = original.split()
-            if 1 <= len(words) <= 4:
-                if all(w.isupper() and w.isalpha() for w in words):
-                    artist = original.title()
-                    logger.info(f"Found all-caps artist: {artist}")
-                elif any(w[0].isupper() for w in words if w.isalpha()) and len(original) > 3:
-                    if not any(word in lower for word in ['records', 'music', 'vol', 'side', 'remix']):
-                        artist = original
-                        logger.info(f"Found mixed-case artist: {artist}")
-                elif 'unknown' in lower and 'artist' in lower:
-                    artist = "Unknown Artist"
-                    logger.info(f"Found unknown artist: {artist}")
-        
-        # Track detection
-        if ':' in ln:
-            parts = ln.split(':', 1)
-            if len(parts) == 2:
-                track_name = parts[1].strip()
-                if track_name and len(track_name) > 2:
-                    tracks.append(track_name)
-        elif ' - ' in ln and not re.search(r'[0-9]{3,}', ln):
-            parts = ln.split(' - ', 1)
-            if len(parts) == 2:
-                track_name = parts[1].strip()
-                if track_name and len(track_name) > 2:
-                    tracks.append(track_name)
+        for pattern in volume_patterns:
+            m = re.search(pattern, all_text)
+            if m:
+                catno = m.group(1).zfill(3)
+                logger.info(f"Found volume pattern: {catno}")
+                break
     
-    logger.info(f"Final extraction: label={label}, catno={catno}, artist={artist}, tracks={len(tracks)}")
+    # Look for artist patterns (general approach)
+    artist_indicators = [
+        r'unknown\s+artist',
+        r'no\s+artist',
+        r'various\s+artists?',
+        r'va\b',  # Various Artists abbreviation
+    ]
+    
+    for pattern in artist_indicators:
+        if re.search(pattern, all_text):
+            if 'unknown' in pattern:
+                artist = "Unknown Artist"
+            elif 'various' in pattern or 'va' in pattern:
+                artist = "Various Artists"
+            else:
+                artist = "No Artist"
+            logger.info(f"Found artist indicator: {artist}")
+            break
+    
+    # If no generic artist found, look for actual artist names in early lines
+    if not artist:
+        for i, line in enumerate(lines[:int(len(lines) * 0.4)]):  # First 40% of lines
+            line_clean = line.strip()
+            words = line_clean.split()
+            
+            # Skip lines with numbers or common label indicators
+            if (1 <= len(words) <= 4 and 
+                not re.search(r'\d{2,}', line_clean) and
+                not any(indicator in line.lower() for indicator in ['vol', 'side', 'records', 'music', 'label'])):
+                
+                # Check if it looks like an artist name
+                if all(w[0].isupper() for w in words if w.isalpha()):  # Title Case
+                    artist = line_clean
+                    logger.info(f"Found potential artist: {artist}")
+                    break
+    
+    # Extract tracks (general approach)
+    for i, line in enumerate(lines):
+        line_lower = line.lower().strip()
+        original = line.strip()
+        
+        # Skip lines that contain metadata indicators
+        metadata_indicators = ['vol', 'volume', 'side', 'records', 'music', 'label', 'catalog']
+        if any(indicator in line_lower for indicator in metadata_indicators):
+            continue
+        
+        # Look for track patterns
+        track_patterns = [
+            r'^[ab]\d*\s*[:\-\.]\s*(.+)',       # A1: Track, B: Track, A. Track
+            r'^\d+\s*[:\-\.]\s*(.+)',           # 1: Track, 1. Track, 1 - Track
+            r'^side\s+[ab]\s*[:\-]\s*(.+)',     # Side A: Track
+            r'^\d+\s+(.+)',                     # 1 Track Name (space separated)
+        ]
+        
+        for pattern in track_patterns:
+            m = re.match(pattern, line_lower)
+            if m:
+                track_name = m.group(1).strip()
+                if len(track_name) > 2 and track_name not in [t.lower() for t in tracks]:
+                    tracks.append(track_name.title())
+                    logger.info(f"Found track: {track_name}")
+                break
+        
+        # Look for lines that might be track names (in latter half of text)
+        elif (i > len(lines) // 2 and  # In second half
+              5 < len(original) < 50 and  # Reasonable length
+              not re.search(r'\d{3,}', original) and  # No long numbers (catalog numbers)
+              original.count(' ') <= 8):  # Not too many words
+            
+            # Additional filtering for track-like content
+            if not any(word in line_lower for word in ['copyright', '©', 'published', 'produced', 'recorded']):
+                tracks.append(original)
+                logger.info(f"Found potential track: {original}")
+    
+    logger.info(f"General extraction result: label={label}, catno={catno}, artist={artist}, tracks={len(tracks)}")
     return label, catno, artist, tracks
+
+def generate_smart_search_attempts(lines: List[str], label: str, catno: str, artist: str, tracks: List[str]) -> List[Dict[str, str]]:
+    """Generate intelligent search attempts for any type of record"""
+    attempts = []
+    
+    logger.info(f"Generating smart searches for: label={label}, catno={catno}, artist={artist}")
+    
+    # Priority 1: Exact catalog patterns (if detected)
+    if label and catno:
+        attempts.extend([
+            {"label": label, "catno": catno},                    # Exact match
+            {"catno": f"{label}{catno}"},                        # LABEL001
+            {"catno": f"{label}-{catno}"},                       # LABEL-001
+            {"catno": f"{label} {catno}"},                       # LABEL 001
+            {"q": f"{label} {catno}"},                           # Text search
+            {"q": f"{label}{catno}"},                            # Combined text search
+        ])
+    
+    # Priority 2: Artist + catalog combinations
+    if artist and catno:
+        attempts.extend([
+            {"artist": artist, "catno": catno},
+            {"artist": artist, "q": catno},
+        ])
+    
+    if artist and label:
+        attempts.extend([
+            {"artist": artist, "label": label},
+            {"artist": artist, "q": label},
+        ])
+    
+    # Priority 3: Smart text-based searches using detected terms
+    smart_text_searches = []
+    
+    # If we found specific terms, use them intelligently
+    detected_terms = []
+    if label: detected_terms.append(label)
+    if catno and len(catno) <= 4: detected_terms.append(catno)  # Don't add long numbers
+    if artist and artist != "Unknown Artist": detected_terms.append(artist)
+    
+    if detected_terms:
+        # Combine detected terms in different ways
+        smart_text_searches.extend([
+            {"q": " ".join(detected_terms)},
+            {"q": " ".join(detected_terms[:2])},  # Just first two terms
+        ])
+    
+    # Priority 4: Track-based searches (for harder to find records)
+    if tracks:
+        for track in tracks[:3]:  # Limit to prevent too many searches
+            if len(track) > 4:  # Only meaningful track names
+                attempts.append({"track": track})
+                if artist:
+                    attempts.append({"track": track, "artist": artist})
+                if label:
+                    attempts.append({"track": track, "label": label})
+    
+    # Priority 5: Fallback text searches from OCR
+    if lines:
+        clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
+        meaningful_lines = [line for line in clean_lines if len(line) > 3]
+        
+        if meaningful_lines:
+            smart_text_searches.extend([
+                {"q": " ".join(meaningful_lines[:4])[:150]},    # First 4 lines
+                {"q": " ".join(meaningful_lines[:3])[:120]},    # First 3 lines  
+                {"q": " ".join(meaningful_lines[:2])[:100]},    # First 2 lines
+                {"q": meaningful_lines[0][:100]},               # Just first line
+            ])
+    
+    attempts.extend(smart_text_searches)
+    
+    # Priority 6: Genre-specific searches (if we detect electronic music terms)
+    all_text_lower = ' '.join(lines).lower()
+    electronic_indicators = ['acid', 'house', 'techno', 'trance', 'electro', 'breakbeat', 'drum', 'bass', 'rave']
+    detected_genres = [genre for genre in electronic_indicators if genre in all_text_lower]
+    
+    for genre in detected_genres[:2]:  # Limit to 2 genres
+        genre_searches = [{"genre": "Electronic", "style": genre.title()}]
+        if catno:
+            genre_searches.append({"q": f"{genre} {catno}", "genre": "Electronic"})
+        attempts.extend(genre_searches)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_attempts = []
+    for search in attempts:
+        search_key = str(sorted(search.items()))
+        if search_key not in seen:
+            unique_attempts.append(search)
+            seen.add(search_key)
+    
+    logger.info(f"Generated {len(unique_attempts)} smart search attempts")
+    return unique_attempts[:15]  # Limit to prevent API overuse
+
+def improved_general_ocr_fallback(text, clean_lines):
+    """General OCR processing that works for any type of record"""
+    candidates = []
+    
+    logger.info("Starting general smart OCR fallback")
+    
+    # Get all OCR text
+    lines = ocr_lines(text)
+    all_lines = list(dict.fromkeys([*lines, *clean_lines]))  # Merge and deduplicate
+    
+    # Extract metadata using general approach
+    label, catno, artist, tracks = extract_general_metadata(all_lines)
+    
+    # Generate smart search attempts
+    attempts = generate_smart_search_attempts(all_lines, label, catno, artist, tracks)
+    
+    # Execute searches with intelligent scoring
+    for i, params in enumerate(attempts):
+        try:
+            logger.info(f"Trying search {i+1}/{len(attempts)}: {params}")
+            results = discogs_search(params)
+            
+            if results:
+                logger.info(f"Search {i+1} found {len(results)} results")
+                
+                # Apply intelligent score boosting
+                for result in results:
+                    boost = 0.0
+                    
+                    # Higher boost for earlier, more targeted searches
+                    if i < 3:
+                        boost += 0.15  # First 3 searches get big boost
+                    elif i < 6:
+                        boost += 0.10  # Next 3 get medium boost
+                    elif i < 10:
+                        boost += 0.05  # Next 4 get small boost
+                    
+                    # Extra boost if result matches our detected metadata
+                    if label and result.label and label.lower() in result.label.lower():
+                        boost += 0.10
+                    if artist and result.artist and artist.lower() in result.artist.lower():
+                        boost += 0.10
+                    
+                    original_score = result.score or 0.70
+                    result.score = min(0.95, original_score + boost)
+                
+                candidates.extend(results)
+                
+                # Stop if we found high-confidence matches
+                high_confidence = [c for c in results if c.score > 0.85]
+                if high_confidence and i < 8:  # Don't stop too early unless very confident
+                    logger.info(f"Found {len(high_confidence)} high-confidence matches")
+                    if len(candidates) >= 5:  # And we have enough results
+                        break
+                
+                # Or if we have many candidates
+                if len(candidates) >= 10:
+                    logger.info("Found enough candidates, stopping search")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Search attempt {i+1} failed: {e}")
+            continue
+    
+    logger.info(f"General OCR fallback returning {len(candidates)} candidates")
+    return candidates[:5]  # Return top 5
 
 # ---------- CLIP functions (with fallbacks) ----------
 _CLIP_DEVICE = "cpu"
@@ -475,240 +684,3 @@ def visual_rerank(user_img_bytes: bytes, cands: List[IdentifyCandidate]) -> List
         # For now, return original order
         return [(c, c.score or 0.0) for c in cands]
     except Exception as e:
-        logger.error(f"Visual rerank error: {e}")
-        return [(c, c.score or 0.0) for c in cands]
-
-# ---------- Main identify route ----------
-@router.post("/api/identify", response_model=IdentifyResponse)
-async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
-    """Main identification endpoint"""
-    try:
-        logger.info(f"Processing file: {file.filename}")
-        image_bytes = await file.read()
-        
-        # Vision API calls
-        v = call_vision_full(image_bytes)
-        web = v.get("webDetection", {})
-        text = v.get("textAnnotations", [])
-        
-        # Enhanced OCR processing
-        text = handwriting_merge(image_bytes, text)
-        extra = block_crop_reocr(image_bytes)
-        
-        if extra:
-            merged = [ln.strip() for ln in (text[0].get("description","").splitlines() if text else []) if ln.strip()]
-            merged.extend(extra)
-            text = [{"description":"\n".join(dict.fromkeys(merged))}]
-
-        # Web detection path
-        release_id, master_id, discogs_url = parse_discogs_web(web)
-        candidates: List[IdentifyCandidate] = []
-
-        if release_id:
-            logger.info(f"Found web match: release_id={release_id}")
-            cached = cache_get(release_id)
-            if cached:
-                candidates.append(IdentifyCandidate(
-                    source="web_cache", 
-                    release_id=release_id, 
-                    discogs_url=cached["discogs_url"],
-                    artist=cached.get("artist"), 
-                    title=cached.get("title"), 
-                    label=cached.get("label"),
-                    year=cached.get("year"), 
-                    cover_url=cached.get("cover_url"), 
-                    score=0.95
-                ))
-            else:
-                rel = fetch_discogs_release_json(release_id)
-                if rel:
-                    row = {
-                        "release_id": release_id,
-                        "discogs_url": discogs_url or rel.get("uri") or f"https://www.discogs.com/release/{release_id}",
-                        "artist": ", ".join(a.get("name","") for a in rel.get("artists",[])),
-                        "title": rel.get("title"),
-                        "label": ", ".join(l.get("name","") for l in rel.get("labels",[])),
-                        "year": str(rel.get("year") or ""),
-                        "cover_url": rel.get("thumb") or (rel.get("images") or [{}])[0].get("uri",""),
-                        "payload": rel,
-                    }
-                    cache_put(row)
-                    candidates.append(IdentifyCandidate(
-                        source="web_live", 
-                        release_id=release_id, 
-                        discogs_url=row["discogs_url"],
-                        artist=row["artist"], 
-                        title=row["title"], 
-                        label=row["label"], 
-                        year=row["year"],
-                        cover_url=row["cover_url"], 
-                        score=0.90
-                    ))
-
-        if not candidates and master_id:
-            candidates.append(IdentifyCandidate(
-                source="web_master", 
-                master_id=master_id,
-                discogs_url=f"https://www.discogs.com/master/{master_id}",
-                note="Master match — select pressing", 
-                score=0.60
-            ))
-
-        # OCR fallback
-        if not candidates:
-            logger.info("No web matches, trying OCR search")
-            lines = ocr_lines(text)
-            clean = [re.sub(r"[^\w\s/-]","",ln).strip() for ln in lines if ln.strip()]
-
-            label, catno, artist, tracks = extract_ocr_metadata(clean)
-
-            # Generate search attempts
-            attempts = []
-            if label and catno:
-                attempts.extend([
-                    {"label": label, "catno": catno},
-                    {"q": f"{label} {catno}"},
-                    {"q": f"{label}-{catno}"},
-                ])
-            
-            if catno:
-                attempts.extend([
-                    {"q": f"tron {catno}"},
-                    {"q": f"tron revolta {catno}"},
-                    {"q": f"unknown artist tron {catno}"},
-                ])
-            
-            if tracks:
-                for track in tracks[:3]:
-                    if len(track) > 4:
-                        attempts.append({"track": track})
-            
-            if clean:
-                attempts.extend([
-                    {"q": " ".join(clean[:3])[:150]},
-                    {"q": " ".join(clean[:2])[:100]},
-                    {"q": clean[0][:100]},
-                ])
-
-            # Execute search attempts
-            for i, params in enumerate(attempts[:10]):
-                try:
-                    results = discogs_search(params)
-                    if results:
-                        for result in results:
-                            if i < 3:  # Boost early matches
-                                result.score = min(0.85, result.score + 0.15)
-                        candidates.extend(results)
-                        if len(candidates) >= 5:
-                            break
-                except Exception as e:
-                    logger.error(f"Search attempt failed: {e}")
-                    continue
-
-        # Visual re-ranking (if available)
-        if len(candidates) >= 2:
-            try:
-                ranked = visual_rerank(image_bytes, candidates)
-                candidates = [c for (c, _) in ranked]
-            except Exception as e:
-                logger.error(f"Visual rerank failed: {e}")
-
-        logger.info(f"Returning {len(candidates)} candidates")
-        return IdentifyResponse(candidates=candidates[:5])
-        
-    except Exception as exc:
-        logger.error(f"Debug identify error: {exc}")
-        return {"error": str(exc)}(f"Identify error: {exc}")
-        raise HTTPException(500, str(exc))
-
-# ---------- Debug endpoint ----------
-@router.post("/api/debug-identify")
-async def debug_identify(file: UploadFile = File(...)):
-    """Debug endpoint to see exactly what OCR detects"""
-    try:
-        image_bytes = await file.read()
-        
-        # Basic Vision API call
-        v = call_vision_full(image_bytes)
-        web = v.get("webDetection", {})
-        text = v.get("textAnnotations", [])
-        
-        # Web detection results
-        web_urls = []
-        for key in ("pagesWithMatchingImages", "fullMatchingImages", "partialMatchingImages", "visuallySimilarImages"):
-            urls = [item.get("url") for item in web.get(key, []) if item.get("url")]
-            if urls:
-                web_urls.extend(urls[:3])
-        
-        release_id, master_id, discogs_url = parse_discogs_web(web)
-        
-        # OCR results
-        raw_ocr = text[0].get("description", "") if text else ""
-        
-        # Enhanced processing
-        text_enhanced = handwriting_merge(image_bytes, text)
-        enhanced_ocr = text_enhanced[0].get("description", "") if text_enhanced else ""
-        
-        block_lines = block_crop_reocr(image_bytes)
-        
-        final_lines = ocr_lines(text_enhanced)
-        if block_lines:
-            merged = list(dict.fromkeys([*final_lines, *block_lines]))
-            final_lines = merged
-        
-        clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in final_lines if ln.strip()]
-        
-        # Extract metadata
-        label, catno, artist, tracks = extract_ocr_metadata(clean_lines)
-        
-        # Test some search queries
-        test_queries = [
-            {"q": "tron 001"},
-            {"q": "tron revolta"},
-            {"q": "unknown artist tron"},
-        ]
-        
-        if label and catno:
-            test_queries.append({"label": label, "catno": catno})
-        
-        search_results = {}
-        for i, query in enumerate(test_queries):
-            try:
-                results = discogs_search(query)
-                search_results[f"query_{i}"] = {
-                    "query": query,
-                    "count": len(results),
-                    "results": [{"artist": r.artist, "title": r.title, "url": r.discogs_url} for r in results[:3]]
-                }
-            except Exception as e:
-                search_results[f"query_{i}"] = {"query": query, "error": str(e)}
-        
-        return {
-            "raw_ocr": raw_ocr,
-            "enhanced_ocr": enhanced_ocr,
-            "block_reocr": block_lines,
-            "final_lines": final_lines,
-            "cleaned_lines": clean_lines,
-            "extracted_metadata": {
-                "label": label,
-                "catno": catno, 
-                "artist": artist,
-                "tracks": tracks
-            },
-            "web_detection": {
-                "release_id": release_id,
-                "master_id": master_id,
-                "discogs_url": discogs_url,
-                "sample_urls": web_urls
-            },
-            "search_results": search_results,
-            "system_info": {
-                "vision_key_set": bool(VISION_KEY),
-                "discogs_token_set": bool(os.environ.get("DISCOGS_TOKEN")),
-                "supabase_available": supabase is not None,
-                "clip_available": CLIP_AVAILABLE,
-            }
-        }
-        
-    except Exception as exc:
-        logger.error
