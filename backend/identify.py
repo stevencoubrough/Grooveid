@@ -651,6 +651,22 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
             # Use improved underground search strategy
             attempts = generate_underground_searches(clean + lines, label, catno, artist, tracks)
             
+            # CRITICAL FIX: Move underground patterns to the front
+            priority_underground = []
+            regular_searches = []
+            
+            for attempt in attempts:
+                # These are the searches that find your record - prioritize them
+                query_text = attempt.get("q", "").lower()
+                if any(pattern in query_text for pattern in ["revolta", "volume", "vol", "unknown artist"]):
+                    priority_underground.append(attempt)
+                else:
+                    regular_searches.append(attempt)
+            
+            # Put underground patterns first, then regular searches
+            attempts = priority_underground + regular_searches
+            logger.info(f"Reordered searches: {len(priority_underground)} priority underground, {len(regular_searches)} regular")
+            
             # Execute searches with smart scoring
             for i, params in enumerate(attempts):
                 try:
