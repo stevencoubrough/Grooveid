@@ -6,7 +6,9 @@ requests
 requests-oauthlib
 supabase==2.2.1
 pillow>=10
-open-clip-torch>=2.24.0
-torch>=2.2.0
-torchvision>=0.17.0
-numpy>=1.25.0
+google-cloud-vision
+python-dotenv
+opencv-python==4.8.1.78
+pytesseract==0.3.10
+scikit-learn==1.3.0
+easyocr==1.7.0
