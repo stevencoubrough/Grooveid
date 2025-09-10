@@ -1,479 +1,401 @@
 # backend/identify.py
-# GrooveID — Complete dynamic version with improved Discogs integration and validation safety
+# GrooveID — dynamic OCR→Discogs pipeline with robust merge & rerank (no hard per-record rules)
+
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Tuple, Dict
-import os, re, io, time, base64, requests, logging
-from io import BytesIO
+from typing import List, Optional, Dict, Tuple
+import os, re, io, json, time, hashlib, logging, difflib
+from collections import defaultdict
+import requests
 from PIL import Image
-import difflib
 
-# Optional imports with graceful fallback
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except Exception:
-    CV2_AVAILABLE = False
-
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except Exception:
-    TESSERACT_AVAILABLE = False
-
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    SKLEARN_AVAILABLE = True
-except Exception:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-except Exception:
-    EASYOCR_AVAILABLE = False
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Log availability
-logger.warning("OpenCV not available - visual analysis disabled" if not CV2_AVAILABLE else "OpenCV available")
-logger.warning("Scikit-learn not available - semantic matching disabled" if not SKLEARN_AVAILABLE else "Scikit-learn available")
-logger.warning("EasyOCR not available" if not EASYOCR_AVAILABLE else "EasyOCR available")
-
-# Initialize router
 router = APIRouter()
 
-# Response models
-class DiscogsCandidate(BaseModel):
-    source: str
-    release_id: int
-    master_id: Optional[int] = None
-    discogs_url: str
-    artist: str
-    title: str
-    label: str
-    year: Optional[int] = None
-    cover_url: Optional[str] = None
-    score: float
-    note: Optional[str] = None
+# ---------------- Config ----------------
+VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
+VISION_KEY = os.environ.get("GOOGLE_VISION_API_KEY", "")
+if not VISION_KEY:
+    logging.warning("GOOGLE_VISION_API_KEY not set. OCR will fail until configured.")
 
-class IdentifyResponse(BaseModel):
-    candidates: List[DiscogsCandidate]
+DGS_API = "https://api.discogs.com"
+DGS_UA  = {"User-Agent": "GrooveID/1.0 (+https://grooveid.app)"}
 
-# ---------- VISION API ----------
-def vision_api_detect(image_bytes: bytes) -> Tuple[Optional[dict], Optional[str]]:
-    """Google Vision API detection"""
-    api_key = os.getenv("GOOGLE_VISION_API_KEY")
-    if not api_key:
-        logger.error("No Vision API key")
-        return None, None
+# How many Discogs results to fetch per query and how many to keep overall
+PER_QUERY = int(os.getenv("GROOVEID_DGS_PER_QUERY", "40"))   # fetch this many from Discogs per query
+KEEP_PER_QUERY = int(os.getenv("GROOVEID_KEEP_PER_QUERY", "12"))  # keep this many per query locally
+MAX_UNION = int(os.getenv("GROOVEID_MAX_UNION", "250"))      # max total candidates after union
 
-    try:
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-        img_b64 = base64.b64encode(image_bytes).decode()
+# ---------------- Helpers: text & tokens ----------------
+SIDEWORDS = set([
+    "side", "sidea", "sideb", "a", "b", "stereo", "mono", "33", "45", "33⅓", "lp",
+    "version", "edit", "mix", "radio", "club", "dub", "remix", "ascension", "ascensión",
+    "promo", "test", "press", "limited", "ep", "single"
+])
 
-        payload = {
-            "requests": [{
-                "image": {"content": img_b64},
-                "features": [
-                    {"type": "WEB_DETECTION", "maxResults": 10},
-                    {"type": "TEXT_DETECTION", "maxResults": 50}
-                ]
-            }]
-        }
+LOGO_TO_LABEL = {
+    "ur": "Underground Resistance",
+    # add more if/when needed, this is tiny and safe
+}
 
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            responses = data.get("responses", [{}])[0]
-            web = responses.get("webDetection", {})
-            text = responses.get("fullTextAnnotation", {}).get("text", "")
-            return web, text
-        else:
-            logger.warning(f"Vision API status: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Vision API error: {e}")
-    return None, None
+def norm_text(s: str) -> str:
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[^\w\s'&:/\-\.]", " ", s, flags=re.UNICODE)  # keep mild punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# ---------- OCR HELPERS ----------
-def ocr_lines(text: str) -> List[str]:
-    """Extract lines from OCR text"""
-    if not text:
-        return []
-    return [ln.strip() for ln in text.strip().split('\n') if ln.strip()]
-
-# ---------- METADATA EXTRACTION ----------
-def extract_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-    """Extract label, catalog, artist, tracks from OCR lines"""
-    label = catno = artist = None
-    tracks: List[str] = []
-
-    for line in lines:
-        upper = line.upper().strip()
-        # Pattern: "WAX 04"
-        if re.match(r'^[A-Z]{2,8}\s+\d{1,4}$', upper):
-            parts = upper.split()
-            if len(parts) == 2:
-                label, catno = parts[0], parts[1].zfill(3)
-                break
-        # Pattern: "WAX-004" or "WAX004"
-        m = re.match(r'^([A-Z]{2,8})[- ]?(\d{1,4})[A-Z]?$', upper)
-        if m:
-            label, catno = m.group(1), m.group(2).zfill(3)
-            break
-
-    # Artist detection - naive proper-case name first
-    for line in lines[:10]:
-        if label and label in line.upper():
-            continue
-        low = line.lower()
-        if any(skip in low for skip in ['manufactured', 'distributed', 'copyright', 'wax trax']):
-            continue
-        if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$', line.strip()):
-            if 4 < len(line) < 40:
-                artist = line.strip()
-                break
-
-    # Track detection
-    track_patterns = [r'^[AB]\d', r'^\d\.', r'^Side [AB]']
-    for line in lines:
-        if any(re.match(p, line) for p in track_patterns):
-            track_name = re.sub(r'^([AB]\d+|[\d\.]+|Side [AB]:?\s*)', '', line).strip()
-            if track_name and len(track_name) > 2:
-                tracks.append(track_name)
-
-    return label, catno, artist, tracks
-
-# ---------- GENRE DETECTION ----------
-def detect_genres(lines: List[str]) -> List[str]:
-    genres: List[str] = []
-    text = ' '.join(lines).lower()
-
-    genre_keywords = {
-        'techno': ['techno', 'detroit', 'minimal', 'industrial'],
-        'house': ['house', 'deep', 'chicago', 'garage', 'soulful'],
-        'drum_and_bass': ['drum and bass', 'dnb', 'jungle', 'neurofunk'],
-        'dubstep': ['dubstep', 'bass', 'wobble', '140'],
-        'trance': ['trance', 'psychedelic', 'goa', 'uplifting'],
-        'acid': ['acid', '303', 'roland', 'squelch']
-    }
-
-    for genre, keywords in genre_keywords.items():
-        if any(kw in text for kw in keywords):
-            genres.append(genre)
-    return genres
-
-# ---------- FUZZY MATCHING ----------
-def fuzzy_match_score(text1: str, text2: str) -> float:
-    if not text1 or not text2:
-        return 0.0
-    return difflib.SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
-
-# ---------- SEARCH STRATEGY ----------
-def generate_dynamic_searches(lines: List[str], label: Optional[str], catno: Optional[str], artist: Optional[str], tracks: List[str]) -> List[Dict]:
-    attempts: List[Dict] = []
-
-    # Artist
-    if artist:
-        attempts.extend([
-            {"q": artist},
-            {"artist": artist},
-        ])
-        if label:
-            attempts.append({"q": f"{artist} {label}"})
-
-    # Label + catno
-    if label and catno:
-        attempts.extend([
-            {"label": label, "catno": catno},
-            {"q": f"{label} {catno}"},
-            {"q": f"{label}-{catno}"},
-        ])
-    elif label:
-        attempts.append({"q": label})
-
-    # Tracks
-    for track in tracks[:2]:
-        if len(track) > 3:
-            clean_track = re.sub(r'\b(\d+rpm|\d+bpm|remix|mix|version)\b', '', track, flags=re.I).strip()
-            if clean_track:
-                attempts.append({"q": clean_track})
-                if artist:
-                    attempts.append({"q": f"{artist} {clean_track}"})
-
-    # Volume / series
-    for line in lines:
-        if re.search(r'vol\.?\s*\d+|volume\s*\d+|ep\s*\d+|part\s*\d+', line.lower()):
-            attempts.append({"q": line})
-
-    # Genre hints
-    genres = detect_genres(lines)
-    if genres and label:
-        if 'techno' in genres or 'house' in genres:
-            attempts.extend([
-                {"q": f"{label} white label"},
-                {"q": f"{label} promo"},
-            ])
-
-    # Meaningful lines
-    meaningful = [
-        line for line in lines
-        if len(line) > 3 and not any(x in line.lower() for x in [
-            'manufactured','distributed','copyright','reserved','unauthorized','broadcasting','intergroove','phone'
-        ])
+def normalize_ocr_lines(lines: List[str]) -> List[str]:
+    txt = " ".join(x for x in lines if x)
+    # common OCR fixes
+    fixes = [
+        (r"\bA\.?\s*K\.?\s*A\.?\b", "AKA"),
+        (r"\bD]?\s?R?OLANDO\b", "DJ ROLANDO"),  # rough guard for weird reads
+        (r"\bUR\b", "UR"),
+        (r"\bASCENSION\b", "Ascensión"),
     ]
-    for line in meaningful[:3]:
-        if label and line.upper() == label:
-            continue
-        if artist and line.upper() == artist.upper():
-            continue
-        if len(line) < 50:
-            attempts.append({"q": line})
+    for pat, rep in fixes:
+        txt = re.sub(pat, rep, txt, flags=re.IGNORECASE)
+    # remove side markers like "Side A", "A", "B" when isolated
+    txt = re.sub(r"\b(SIDE\s*[AB]|SIDE|[AB])\b", " ", txt, flags=re.IGNORECASE)
+    # collapse
+    txt = norm_text(txt)
+    # split back into lines (coarse)
+    return [seg.strip() for seg in re.split(r"[|/•·\n]", txt) if seg.strip()]
 
-    # Dedup while preserving order
+def tokens(s: str) -> List[str]:
+    s = s.lower()
+    toks = re.findall(r"[a-z0-9'&]+", s)
+    return [t for t in toks if t not in SIDEWORDS and len(t) >= 2]
+
+def jaccard(a: List[str], b: List[str]) -> float:
+    A, B = set(a), set(b)
+    if not A or not B: return 0.0
+    return len(A & B) / len(A | B)
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+# ---------------- OCR (Google Vision) ----------------
+def vision_ocr(image_bytes: bytes) -> List[str]:
+    img_b64 = Image.open(io.BytesIO(image_bytes))
+    # ensure RGB / small sanity resize (optional; we can send raw bytes too)
+    buf = io.BytesIO()
+    img_b64.save(buf, format="JPEG", quality=90)
+    jpg_b64 = buf.getvalue()
+
+    payload = {
+        "requests": [{
+            "image": {"content": jpg_b64.encode("base64") if False else None},
+            "features": [
+                {"type": "TEXT_DETECTION"},
+                {"type": "DOCUMENT_TEXT_DETECTION"},
+                {"type": "WEB_DETECTION", "maxResults": 5},
+                {"type": "LOGO_DETECTION", "maxResults": 5},
+            ]
+        }]
+    }
+    # Because Python's standard library doesn't do base64 this way, build proper JSON:
+    import base64
+    payload["requests"][0]["image"]["content"] = base64.b64encode(jpg_b64).decode("utf-8")
+
+    url = f"{VISION_ENDPOINT}?key={VISION_KEY}"
+    r = requests.post(url, json=payload, timeout=30)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Vision API error: {r.text[:300]}")
+    data = r.json()
+    resp = data.get("responses", [{}])[0]
+
+    lines = []
+    # document text
+    if "fullTextAnnotation" in resp and resp["fullTextAnnotation"].get("text"):
+        lines.extend([l for l in resp["fullTextAnnotation"]["text"].split("\n") if l.strip()])
+
+    # web detection labels (sometimes super useful)
+    for w in resp.get("webDetection", {}).get("bestGuessLabels", []):
+        if w.get("label"):
+            lines.append(w["label"])
+
+    # logos (UR etc.)
+    for logo in resp.get("logoAnnotations", []):
+        if logo.get("description"):
+            lines.append(logo["description"])
+
+    # coarse textAnnotations
+    for t in resp.get("textAnnotations", [])[1:]:
+        if t.get("description"):
+            lines.append(t["description"])
+
+    # de-dup & normalize
     seen = set()
-    unique: List[Dict] = []
-    for a in attempts:
-        key = tuple(sorted(a.items()))
+    clean = []
+    for l in normalize_ocr_lines(lines):
+        key = l.lower()
         if key not in seen:
             seen.add(key)
-            unique.append(a)
-    return unique
+            clean.append(l)
+    return clean[:60]  # cap
 
-# ---------- DISCOGS HELPERS ----------
-def _normalize_discogs_params(attempt: dict) -> dict:
-    p = {"type": "release"}
-    if attempt.get("artist"):
-        p["artist"] = attempt["artist"]
-    if attempt.get("label"):
-        p["label"] = attempt["label"]
-    if attempt.get("catno"):
-        p["catno"] = attempt["catno"]
-    if attempt.get("q"):
-        p["q"] = attempt["q"]
-    return p
+# ---------------- Entity hints (soft) ----------------
+def extract_hints(lines: List[str]) -> Dict[str, List[str]]:
+    joined = " " + " | ".join(lines) + " "
+    low = joined.lower()
 
+    artist_hints, label_hints, strong_phrases = [], [], []
 
-def fetch_release_details(release_id: int) -> Optional[dict]:
-    try:
-        token = os.getenv("DISCOGS_TOKEN")
-        headers = {"User-Agent": os.getenv("DGS_UA", "GrooveID/1.0 (+https://grooveid.app)")}
-        if token:
-            headers["Authorization"] = f"Discogs token={token}"
-        r = requests.get(f"https://api.discogs.com/releases/{release_id}", headers=headers, timeout=6)
-        if r.status_code == 200:
-            d = r.json()
-            title = d.get("title", "") or ""
-            artists = d.get("artists", []) or []
-            labels = d.get("labels", []) or []
-            images = d.get("images", []) or []
-            return {
-                "release_id": release_id,
-                "master_id": d.get("master_id"),
-                "discogs_url": f"https://www.discogs.com/release/{release_id}",
-                "artist": (artists[0].get("name") if artists else "") or "Unknown",
-                "title": title,
-                "label": (labels[0].get("name") if labels else "") or "",
-                "year": d.get("year"),
-                "cover_url": next((im.get("uri") for im in images if im.get("type") == "primary"), None),
-            }
-        logger.warning(f"Release fetch {release_id} -> {r.status_code}")
-    except Exception as e:
-        logger.error(f"Discogs release fetch error: {e}")
-    return None
+    # phrases: long-ish spans from lines with 3–8 tokens, keep the meaty ones
+    for ln in lines:
+        tk = tokens(ln)
+        if 3 <= len(tk) <= 8 and len(" ".join(tk)) >= 12:
+            strong_phrases.append(ln)
 
+    # artist patterns near aka/producer/by/feat
+    ART_PAT = r"(?:by|aka|a\.?k\.?a\.?|producer|produced by|feat\.?|featuring)\s+([A-Za-z0-9 '&/.+-]{2,40})"
+    for m in re.finditer(ART_PAT, low, flags=re.IGNORECASE):
+        cand = norm_text(m.group(1))
+        if cand and cand.lower() not in SIDEWORDS:
+            artist_hints.append(cand)
 
-def search_discogs(params: dict) -> List[dict]:
-    """Search Discogs API with normalized params."""
-    out: List[dict] = []
-    try:
-        query = _normalize_discogs_params(params)
-        token = os.getenv("DISCOGS_TOKEN")
-        headers = {"User-Agent": os.getenv("DGS_UA", "GrooveID/1.0 (+https://grooveid.app)")}
-        if token:
-            headers["Authorization"] = f"Discogs token={token}"
-        url = "https://api.discogs.com/database/search"
+    # logos → labels
+    for logo, label in LOGO_TO_LABEL.items():
+        if f" {logo} " in low:
+            label_hints.append(label)
 
-        for attempt_num in range(3):
-            resp = requests.get(url, params=query, headers=headers, timeout=6)
-            if resp.status_code == 429 and attempt_num < 2:
-                time.sleep(0.5 * (attempt_num + 1))
-                continue
-            if resp.status_code != 200:
-                logger.warning(f"Discogs search {query} -> {resp.status_code}")
-                return out
-            data = resp.json()
-            for r in data.get("results", [])[:10]:
-                title = r.get("title", "") or ""
-                artist, release_title = ("Unknown", title)
-                if " - " in title:
-                    parts = title.split(" - ", 1)
-                    artist, release_title = parts[0], parts[1]
-                out.append({
-                    "release_id": r.get("id"),
-                    "master_id": r.get("master_id"),
-                    "discogs_url": f"https://www.discogs.com/release/{r.get('id')}",
-                    "artist": artist,
-                    "title": release_title,
-                    "label": (r.get("label") or [""])[0] if isinstance(r.get("label"), list) else (r.get("label") or ""),
-                    "year": r.get("year"),
-                    "cover_url": r.get("cover_image"),
-                })
-            break
-    except Exception as e:
-        logger.error(f"Discogs search error: {e}")
-    return out
+    # simple label words
+    for m in re.finditer(r"([A-Za-z0-9 '&/.+-]{2,40})\s+(?:records|rec\.|music|recordings)", low, flags=re.I):
+        cand = norm_text(m.group(1))
+        if cand:
+            label_hints.append(cand + " Records")
 
-# ---------- SCORING ----------
-def calculate_advanced_score(result: dict, search_idx: int, result_idx: int,
-                            label: Optional[str], catno: Optional[str], artist: Optional[str],
-                            tracks: List[str], genres: List[str], lines: List[str]) -> float:
-    base_score = 1.0 - (search_idx * 0.05) - (result_idx * 0.02)
-    if artist and result.get('artist'):
-        base_score *= (1 + fuzzy_match_score(artist, result['artist']) * 0.3)
-    if label and result.get('label'):
-        base_score *= (1 + fuzzy_match_score(label, result['label']) * 0.2)
-    result_title = (result.get('title') or '').lower()
-    for track in tracks:
-        if fuzzy_match_score(track, result_title) > 0.7:
-            base_score *= 1.25
-            break
-    if genres:
-        text = f"{result.get('artist','')} {result.get('title','')}".lower()
-        if any(g in text for g in genres):
-            base_score *= 1.1
-    if any(term in (result.get('title','').lower()) for term in ['white label','promo','unknown','various','dub']):
-        base_score *= 1.15
-    return min(base_score, 0.99)
+    # de-dup & trim
+    def uniq(xs): 
+        out, seen = [], set()
+        for x in xs:
+            k = x.strip().lower()
+            if k and k not in seen:
+                seen.add(k); out.append(x.strip())
+        return out
 
-# ---------- MAIN OCR FALLBACK ----------
-def improved_ocr_fallback_with_ml(text: str, image_bytes: bytes) -> List[dict]:
-    candidates: List[dict] = []
-    lines = ocr_lines(text)
+    return {
+        "artist_hints": uniq(artist_hints)[:4],
+        "label_hints": uniq(label_hints)[:4],
+        "phrases": uniq(strong_phrases)[:6]
+    }
 
-    label, catno, artist, tracks = extract_metadata(lines)
-    genres = detect_genres(lines)
-    logger.info(f"Extracted - Label: {label}, Catno: {catno}, Artist: {artist}, Genres: {genres}")
+# ---------------- Query set ----------------
+def build_queries(hints: Dict[str, List[str]]) -> List[str]:
+    phrases = hints["phrases"] or []
+    artists = hints["artist_hints"] or []
+    labels  = hints["label_hints"] or []
 
-    attempts = generate_dynamic_searches(lines, label, catno, artist, tracks)
-    logger.info(f"Generated {len(attempts)} dynamic search attempts")
+    queries = []
+    # base phrases
+    queries.extend(phrases[:4])
 
-    for i, attempt in enumerate(attempts[:15]):
-        results = search_discogs(attempt)
-        for j, result in enumerate(results[:5]):
-            score = calculate_advanced_score(result, i, j, label, catno, artist, tracks, genres, lines)
-            result['score'] = min(score, 0.99)
-            result['source'] = 'ocr_search'
-            candidates.append(result)
-        if len(candidates) >= 10 and any(c.get('score', 0) > 0.85 for c in candidates):
-            break
+    # phrase + artist
+    for p in phrases[:4]:
+        for a in artists[:3]:
+            queries.append(f"{p} {a}")
 
-    candidates.sort(key=lambda x: x.get('score', 0), reverse=True)
-    return candidates[:5]
+    # phrase + label
+    for p in phrases[:4]:
+        for l in labels[:2]:
+            queries.append(f"{p} {l}")
 
-# ---------- MAIN IDENTIFY FUNCTION ----------
+    # artist-only with generic record terms (helps on eponymous singles)
+    for a in artists[:3]:
+        queries.append(f"{a} EP")
+        queries.append(f"{a} 12\"")
+
+    # final fallback: top single short line (<20 chars, not sideword-y)
+    short_lines = [p for p in phrases if 4 <= len(p) <= 20]
+    queries.extend(short_lines[:2])
+
+    # dedupe
+    seen, out = set(), []
+    for q in queries:
+        qn = norm_text(q)
+        if qn and qn.lower() not in seen:
+            seen.add(qn.lower())
+            out.append(qn)
+    # cap
+    return out[:16] if out else ["vinyl record label"]  # last-resort junk query
+
+# ---------------- Discogs search & hydrate ----------------
+def discogs_search(q: str, per_page: int = 40) -> List[Dict]:
+    params = {
+        "q": q,
+        "type": "release",
+        "format": "Vinyl",
+        "per_page": per_page,
+        "page": 1,
+    }
+    r = requests.get(f"{DGS_API}/database/search", headers=DGS_UA, params=params, timeout=20)
+    if r.status_code != 200:
+        # Backoff on rate limiting or transient errors
+        if r.status_code in (429, 503):
+            time.sleep(1.2)
+            r = requests.get(f"{DGS_API}/database/search", headers=DGS_UA, params=params, timeout=20)
+        if r.status_code != 200:
+            logging.warning(f"Discogs search error {r.status_code}: {r.text[:200]}")
+            return []
+    data = r.json()
+    return data.get("results", [])
+
+def hydrate_release(release_id: int) -> Dict:
+    """Fetch a release to get master_id and images; keep it quick."""
+    r = requests.get(f"{DGS_API}/releases/{release_id}", headers=DGS_UA, timeout=20)
+    if r.status_code != 200:
+        return {}
+    return r.json()
+
+# ---------------- Scoring ----------------
+def field(s): return s or ""
+
+def title_support(candidate_title: str, phrases: List[str]) -> float:
+    # strongest signal: exact or fuzzy containment of phrase within title
+    score = 0.0
+    tl = candidate_title.lower()
+    for p in phrases[:4]:
+        pl = p.lower()
+        if pl and pl in tl:
+            score = max(score, 3.0)
+        else:
+            fr = fuzzy_ratio(p, candidate_title)
+            if fr >= 0.70:
+                score = max(score, 2.0)
+    # token overlap as backstop
+    if score < 2.0:
+        score = max(score, 1.5 * jaccard(tokens(candidate_title), tokens(" ".join(phrases))))
+    return score
+
+def contains_any(text: str, hints: List[str]) -> Tuple[bool, bool]:
+    text_l = text.lower()
+    exact = any(h.lower() in text_l for h in hints)
+    partial = any(jaccard(tokens(text), tokens(h)) >= 0.5 for h in hints) if hints else False
+    return exact, partial
+
+def score_candidate(c: Dict, hints: Dict[str, List[str]], votes_by_master: Dict[int,int]) -> float:
+    s = 0.0
+    title = field(c.get("title"))
+    artist = field(c.get("artist"))
+    label  = field(c.get("label"))
+
+    # Title
+    s += title_support(title, hints["phrases"])
+
+    # Artist (soft)
+    ex, pa = contains_any(artist, hints["artist_hints"])
+    if ex: s += 1.8
+    elif pa: s += 1.2
+
+    # Label (soft)
+    ex, pa = contains_any(label, hints["label_hints"])
+    if ex: s += 1.0
+    elif pa: s += 0.6
+
+    # Master consensus
+    mid = c.get("master_id")
+    if mid:
+        s += 0.9 * votes_by_master.get(mid, 0)
+
+    # Penalties: if title looks like we accidentally promoted sidewords
+    if any(w in artist.lower() for w in SIDEWORDS):
+        s -= 0.6
+    if any(w in title.lower().split() for w in ("version","edit","mix")) and s < 3.0:
+        s -= 0.3
+
+    return round(float(s), 4)
+
+# ---------------- API models ----------------
+class IdentifyResponse(BaseModel):
+    candidates: List[Dict]
+
+# ---------------- Main endpoint ----------------
 @router.post("/api/identify", response_model=IdentifyResponse)
-async def identify_record(file: UploadFile = File(...)):
+async def identify_api(file: UploadFile = File(...)) -> IdentifyResponse:
     try:
         image_bytes = await file.read()
-        Image.open(BytesIO(image_bytes))  # validate image
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file.")
 
-        web, text = vision_api_detect(image_bytes)
-        candidates: List[dict] = []
+        # 1) OCR
+        lines = vision_ocr(image_bytes)
+        if not lines:
+            raise HTTPException(status_code=422, detail="No text detected by OCR.")
+        # 2) Hints & queries
+        hints = extract_hints(lines)
+        queries = build_queries(hints)
 
-        # Use Vision webDetection to grab direct Discogs releases, hydrate with details
-        if web:
-            web_urls: List[str] = []
-            for key in ("pagesWithMatchingImages", "fullMatchingImages", "partialMatchingImages", "visuallySimilarImages"):
-                urls = [item.get("url") for item in web.get(key, []) if item.get("url")]
-                if urls:
-                    web_urls.extend(urls)
-            for url in web_urls[:5]:
-                if "discogs.com/release/" in url:
-                    m = re.search(r'/release/(\d+)', url)
-                    if not m:
-                        continue
-                    rid = int(m.group(1))
-                    details = fetch_release_details(rid)
-                    if details:
-                        details.update({"source": "web_detection", "score": 0.95, "note": "Direct web match"})
-                        candidates.append(details)
+        # 3) Retrieve candidates from Discogs across all queries
+        union: Dict[int, Dict] = {}
+        votes_by_master: Dict[int,int] = defaultdict(int)
 
-        if not candidates and text:
-            logger.info("No web matches, trying dynamic OCR search")
-            candidates = improved_ocr_fallback_with_ml(text, image_bytes)
+        for q in queries:
+            results = discogs_search(q, per_page=PER_QUERY)[:KEEP_PER_QUERY]
+            for r in results:
+                # coerce
+                rid = r.get("id") or r.get("release_id")
+                if not rid: 
+                    continue
+                rid = int(rid)
+                # normalize
+                cand = union.get(rid) or {
+                    "release_id": rid,
+                    "master_id": r.get("master_id"),
+                    "title": r.get("title") or "",
+                    "artist": r.get("artist") or r.get("title", "").split("-")[0].strip(),
+                    "label": (r.get("label") or (r.get("label_name") if isinstance(r.get("label_name"), str) else None) or ""),
+                    "year": r.get("year"),
+                    "country": r.get("country"),
+                    "format": ", ".join(r.get("format", [])) if isinstance(r.get("format"), list) else r.get("format"),
+                    "discogs_url": r.get("uri") or f"https://www.discogs.com/release/{rid}",
+                    "cover_url": r.get("cover_image") or r.get("thumb"),
+                    "source_queries": set(),
+                }
+                cand["source_queries"].add(q)
+                union[rid] = cand
 
-        if not candidates:
-            candidates = [{
-                "source": "none",
-                "release_id": 0,
-                "master_id": None,
-                "discogs_url": "",
-                "artist": "Unknown",
-                "title": "No matches found",
-                "label": "",
-                "year": None,
-                "cover_url": None,
-                "score": 0.0,
-                "note": "Try a clearer image"
-            }]
+                # master vote
+                mid = r.get("master_id")
+                if mid:
+                    votes_by_master[int(mid)] += 1
 
-        return IdentifyResponse(candidates=candidates)
+            if len(union) >= MAX_UNION:
+                break
 
+        if not union:
+            return IdentifyResponse(candidates=[])
+
+        # 4) Hydrate top-N for missing master_id/cover (lightweight)
+        # Find items missing master_id or cover and hydrate a handful
+        need = [rid for rid,c in union.items() if not c.get("master_id") or not c.get("cover_url")]
+        for rid in need[:25]:
+            info = hydrate_release(rid)
+            if info:
+                c = union[rid]
+                c["master_id"] = c.get("master_id") or info.get("master_id")
+                if not c.get("cover_url"):
+                    img = (info.get("images") or [{}])[0] if info.get("images") else {}
+                    c["cover_url"] = img.get("uri") or img.get("resource_url")
+
+        # 5) Score
+        for rid, c in union.items():
+            c["score"] = score_candidate(c, hints, votes_by_master)
+            # serialize queries
+            c["source_queries"] = list(c["source_queries"])
+
+        # 6) Sort & shape
+        ranked = sorted(union.values(), key=lambda x: x["score"], reverse=True)
+        for c in ranked:
+            # keep keys tidy
+            c.pop("format", None)
+        # return top 15 (tune as needed)
+        top = ranked[:15]
+
+        return IdentifyResponse(candidates=top)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Identify error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.exception("identify_api error")
+        raise HTTPException(status_code=500, detail=str(e)[:300])
 
-# ---------- DEBUG ENDPOINT ----------
-@router.post("/api/debug-identify")
-async def debug_identify(file: UploadFile = File(...)):
-    try:
-        image_bytes = await file.read()
-        img = Image.open(BytesIO(image_bytes))
-        web, text = vision_api_detect(image_bytes)
-        all_lines = ocr_lines(text)
-        label, catno, artist, tracks = extract_metadata(all_lines)
-        genres = detect_genres(all_lines)
-        attempts = generate_dynamic_searches(all_lines, label, catno, artist, tracks)
-
-        search_results = {}
-        for i, attempt in enumerate(attempts[:5]):
-            results = search_discogs(attempt)
-            search_results[f"query_{i}"] = {
-                "query": attempt,
-                "count": len(results),
-                "results": results[:3]
-            }
-
-        return {
-            "raw_ocr": text,
-            "final_lines": all_lines,
-            "extracted_metadata": {
-                "label": label,
-                "catno": catno,
-                "artist": artist,
-                "tracks": tracks
-            },
-            "detected_genres": genres,
-            "generated_searches": attempts[:10],
-            "search_results": search_results,
-            "system_info": {
-                "vision_key_set": bool(os.getenv("GOOGLE_VISION_API_KEY")),
-                "discogs_token_set": bool(os.getenv("DISCOGS_TOKEN")),
-                "cv2_available": CV2_AVAILABLE,
-                "tesseract_available": TESSERACT_AVAILABLE,
-                "sklearn_available": SKLEARN_AVAILABLE,
-                "easyocr_available": EASYOCR_AVAILABLE
-            }
-        }
-    except Exception as exc:
-        logger.error(f"Debug identify error: {exc}")
-        return {"error": str(exc)}
-
-# ---------- HEALTHCHECK ----------
-@router.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
