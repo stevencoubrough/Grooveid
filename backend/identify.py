@@ -207,26 +207,22 @@ def extract_ocr_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str]
         if m and not catno:
             l = m.group(1).strip()
             label = l.title() if l else label
-            catno = m.group(2)
-            continue
+            catno = m.group(2); continue
         # e.g. "urban decay 003"
         m2 = re.match(r"([a-z0-9\s]+?)\s+(\d{1,5})$", lower)
         if m2 and not catno:
             l = m2.group(1).strip()
             label = l.title() if l else label
-            catno = m2.group(2)
-            continue
+            catno = m2.group(2); continue
         # artist heuristic: short UPPERCASE line (not first)
         if not artist and i > 0:
             words = ln.strip().split()
             if 1 <= len(words) <= 3 and all(w.isupper() for w in words if w.isalpha()):
-                artist = ln.strip().title()
-                continue
+                artist = ln.strip().title(); continue
         # track lines
         if ":" in ln:
             t = ln.split(":", 1)[1].strip()
-            if t: tracks.append(t)
-            continue
+            if t: tracks.append(t); continue
         if " - " in ln and not artist and not re.search(r"\d", ln):
             t = ln.split(" - ", 1)[1].strip()
             if t: tracks.append(t)
@@ -269,21 +265,33 @@ def find_label_catno(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 def discogs_search_track(track: str, limit: int = 8) -> List[int]:
-    params: Dict[str, str] = {"track": track, "type": "release"}
+    """Return release IDs by searching Discogs for a track; try hyphenless variant too."""
     tok = os.environ.get("DISCOGS_TOKEN")
-    if tok: params["token"] = tok
-    try:
-        r = requests.get(f"{DGS_API}/database/search", headers=DGS_UA, params=params, timeout=20)
-        if r.status_code != 200: return []
-        ids: List[int] = []
-        for it in r.json().get("results", [])[:limit]:
-            res_url = it.get("resource_url", "")
-            if "/releases/" in res_url:
-                try: ids.append(int(res_url.rstrip("/").split("/")[-1]))
-                except Exception: pass
-        return ids
-    except Exception:
-        return []
+    headers = DGS_UA
+    ids: set[int] = set()
+
+    def _q(qtrack: str):
+        params: Dict[str, str] = {"track": qtrack, "type": "release"}
+        if tok: params["token"] = tok
+        try:
+            r = requests.get(f"{DGS_API}/database/search", headers=headers, params=params, timeout=20)
+            if r.status_code != 200: return
+            for it in r.json().get("results", [])[:limit]:
+                res_url = it.get("resource_url", "")
+                if "/releases/" in res_url:
+                    try:
+                        ids.add(int(res_url.rstrip("/").split("/")[-1]))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    track_hl = track.replace("-", " ")
+    _q(track)
+    if track_hl != track:
+        _q(track_hl)
+
+    return list(ids)
 
 def vote_releases_by_tracks(tracks: List[str]) -> List[int]:
     """Return releases that match >=2 tracks, sorted by votes desc then id asc."""
@@ -518,9 +526,10 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
             if not catno and cat_from_cat: catno = cat_from_cat
 
             # Track voting first (>=2 tracks to count)
-            if len(tracks) >= 2:
+            tracks_hl = list(dict.fromkeys([*tracks, *[t.replace("-", " ") for t in tracks]]))
+            if len(tracks_hl) >= 2:
                 try:
-                    voted_ids = vote_releases_by_tracks(tracks)
+                    voted_ids = vote_releases_by_tracks(tracks_hl)
                     for rid in voted_ids:
                         if rid and all((c.release_id != rid for c in candidates)):
                             rel = fetch_discogs_release_json(rid)
@@ -545,22 +554,38 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
             if label and catno:        search_attempts.append({"label": label, "catno": catno})
             if artist and catno:       search_attempts.append({"artist": artist, "catno": catno})
 
-            # If we only have tracks (no artist/label), allow direct per-track search
-            if tracks and not artist and not label and not candidates:
-                for t in tracks[:4]:
+            # Catno-only and label-token + catno attempts
+            label_tokens = set()
+            if label: label_tokens.add(label)
+            if lbl_from_cat: label_tokens.add(lbl_from_cat.title())
+            if catno:
+                search_attempts.append({"catno": catno})
+                for lbl in label_tokens:
+                    search_attempts.append({"label": lbl, "catno": catno})
+
+            # Per-track search if we still need more signals
+            if tracks_hl and not candidates:
+                for t in tracks_hl[:4]:
                     for rid in discogs_search_track(t, limit=6):
                         rel = fetch_discogs_release_json(rid)
                         if rel:
                             candidates.append(candidate_from_release_json(rel, "track_search", 0.70))
 
-            # Broad fallbacks if still empty
+            # Joined-tracks fallbacks
+            if not candidates and tracks_hl:
+                joined = " ".join(tracks_hl)[:200]
+                search_attempts.append({"q": joined})
+                if catno: search_attempts.append({"q": f"{joined} {catno}"[:200]})
+                for lbl in label_tokens:
+                    if lbl and catno:
+                        search_attempts.append({"q": f"{lbl} {catno} {joined}"[:200]})
+
+            # Clean-lines fallbacks
             if not candidates and clean_lines:
-                q_parts: List[str] = []
-                q_parts.append(" ".join(clean_lines[:3])[:200])
-                if len(clean_lines) >= 2: q_parts.append(" ".join(clean_lines[:2])[:200])
-                q_parts.append(clean_lines[0][:200])
-                for q in q_parts:
-                    search_attempts.append({"q": q})
+                search_attempts.append({"q": " ".join(clean_lines[:3])[:200]})
+                if len(clean_lines) >= 2:
+                    search_attempts.append({"q": " ".join(clean_lines[:2])[:200]})
+                search_attempts.append({"q": clean_lines[0][:200]})
 
             # Execute search attempts
             ricardo_hits: List[IdentifyCandidate] = []
@@ -588,3 +613,4 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
         return IdentifyResponse(candidates=candidates[:5])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
