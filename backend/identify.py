@@ -1,5 +1,5 @@
 # backend/identify.py
-# GrooveID — Complete working version with improved underground record detection
+# GrooveID — Complete working version with improved underground record detection and better metadata extraction
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
@@ -348,41 +348,67 @@ def discogs_search(params: Dict[str, str]) -> List[IdentifyCandidate]:
     
     return out
 
-# ---------- Metadata extraction ----------
+# ---------- IMPROVED Metadata extraction ----------
 def extract_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
     label = catno = artist = None
     tracks = []
     
     all_text = ' '.join(lines).lower()
     
-    # Label + catalog patterns
-    patterns = [
-        r'([a-z]{3,8})\s*(\d{3})',
-        r'([a-z]{3,8})\s+(\d{3})',
-        r'([a-z]{3,8})-(\d{3})',
-        r'([a-z]{3,8})\s*-\s*(\d{3})',
-        r'([a-z]{2,8})\s+(\d{2,4})',
-        r'([a-z]{3,8})(\d{3})',
+    # Look for explicit label patterns first (more specific)
+    explicit_patterns = [
+        r'([a-z]{3,8})\s+(\d{2,3})(?:\s|$)',    # WAX 04, ACID 123
+        r'([a-z]{3,8})-(\d{2,3})(?:\s|$)',      # WAX-04
+        r'([a-z]{3,8})(\d{2,3})(?:\s|$)',       # WAX04
     ]
     
-    for pattern in patterns:
-        m = re.search(pattern, all_text)
-        if m:
+    for pattern in explicit_patterns:
+        matches = re.finditer(pattern, all_text)
+        for m in matches:
             potential_label = m.group(1).upper()
             potential_catno = m.group(2).zfill(3)
             
-            excluded_words = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM']
-            if potential_label not in excluded_words and len(potential_label) >= 3:
+            # Skip common false positives
+            excluded_words = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM', 'LTD', 'INC']
+            phone_context = any(phone in all_text[max(0, m.start()-20):m.end()+20] for phone in ['0181', '020', '01', 'phone', 'tel'])
+            
+            if (potential_label not in excluded_words and 
+                len(potential_label) >= 3 and 
+                not phone_context):  # Skip if it's near phone numbers
                 label = potential_label
                 catno = potential_catno
+                logger.info(f"Found explicit label/catno: {label} {catno}")
                 break
+        if label:
+            break
+    
+    # If no explicit pattern, try general patterns
+    if not label:
+        general_patterns = [
+            r'([a-z]{3,8})\s*(\d{3})',
+            r'([a-z]{3,8})\s+(\d{2,4})',
+            r'([a-z]{3,8})-(\d{3})',
+            r'([a-z]{3,8})\s*-\s*(\d{3})',
+        ]
+        
+        for pattern in general_patterns:
+            m = re.search(pattern, all_text)
+            if m:
+                potential_label = m.group(1).upper()
+                potential_catno = m.group(2).zfill(3)
+                
+                excluded_words = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM', 'LTD', 'INC']
+                if potential_label not in excluded_words and len(potential_label) >= 3:
+                    label = potential_label
+                    catno = potential_catno
+                    break
     
     # Volume patterns
     if not catno:
         volume_patterns = [
-            r'vol\.?\s*(\d+)',
-            r'volume\s+(\d+)',
-            r'v\.?\s*(\d+)',
+            r'vol\.?\s*#?(\d+)',
+            r'volume\s+#?(\d+)',
+            r'v\.?\s*#?(\d+)',
             r'part\s+(\d+)',
             r'ep\s*(\d+)',
         ]
@@ -391,32 +417,43 @@ def extract_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Op
             m = re.search(pattern, all_text)
             if m:
                 catno = m.group(1).zfill(3)
+                logger.info(f"Found volume pattern: {catno}")
                 break
     
-    # Artist patterns
-    artist_indicators = [
-        r'unknown\s+artist',
-        r'no\s+artist',
-        r'various\s+artists?',
-        r'va\b',
-    ]
-    
-    for pattern in artist_indicators:
-        if re.search(pattern, all_text):
-            if 'unknown' in pattern:
-                artist = "Unknown Artist"
-            elif 'various' in pattern or 'va' in pattern:
-                artist = "Various Artists"
-            else:
-                artist = "No Artist"
-            break
+    # Artist patterns - look for title/artist names in early lines
+    for i, line in enumerate(lines[:int(len(lines) * 0.4)]):  # First 40% of lines
+        line_clean = line.strip()
+        words = line_clean.split()
+        
+        # Skip lines with common metadata indicators
+        skip_indicators = ['vol', 'volume', 'side', 'records', 'music', 'label', 'catalog', 'manufactured', 'distributed', 'copyright', 'published']
+        if any(indicator in line.lower() for indicator in skip_indicators):
+            continue
+        
+        # Skip lines that are likely track listings
+        if re.match(r'^[ab]\d*[\s:\-\.]', line.lower()) or re.match(r'^\d+[\s:\-\.]', line.lower()):
+            continue
+        
+        # Look for artist names (reasonable length, not too many words)
+        if (2 <= len(words) <= 4 and 
+            5 <= len(line_clean) <= 30 and
+            not re.search(r'\d{2,}', line_clean) and  # No long numbers
+            not any(word in line.lower() for word in skip_indicators)):
+            
+            # Check if it looks like an artist name (title case or mixed case)
+            if (any(w[0].isupper() for w in words if w.isalpha()) or 
+                all(w.isupper() for w in words if w.isalpha())):
+                artist = line_clean
+                logger.info(f"Found potential artist: {artist}")
+                break
     
     # Track extraction
     for i, line in enumerate(lines):
         line_lower = line.lower().strip()
         original = line.strip()
         
-        metadata_indicators = ['vol', 'volume', 'side', 'records', 'music', 'label', 'catalog']
+        # Skip metadata lines
+        metadata_indicators = ['vol', 'volume', 'side', 'records', 'music', 'label', 'catalog', 'manufactured', 'distributed', 'copyright', 'published', 'written', 'produced']
         if any(indicator in line_lower for indicator in metadata_indicators):
             continue
         
@@ -431,10 +468,13 @@ def extract_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Op
             m = re.match(pattern, line_lower)
             if m:
                 track_name = m.group(1).strip()
+                # Clean track name
+                track_name = re.sub(r'\s*-?\s*\d+rpm\s*$', '', track_name)  # Remove "45rpm", "33rpm"
                 if len(track_name) > 2 and track_name not in [t.lower() for t in tracks]:
                     tracks.append(track_name.title())
                 break
     
+    logger.info(f"Final metadata: label={label}, catno={catno}, artist={artist}, tracks={len(tracks)}")
     return label, catno, artist, tracks
 
 # ---------- IMPROVED search strategy for underground records ----------
@@ -472,7 +512,25 @@ def generate_underground_searches(lines: List[str], label: str, catno: str, arti
         ]
         attempts.extend(underground_base)
     
-    # Priority 3: Volume/series patterns
+    # Priority 3: Artist-based searches (if detected)
+    if artist:
+        artist_searches = [
+            {"artist": artist},
+            {"q": artist},
+        ]
+        if label:
+            artist_searches.extend([
+                {"artist": artist, "label": label},
+                {"q": f"{artist} {label}"},
+            ])
+        if catno:
+            artist_searches.extend([
+                {"artist": artist, "catno": catno},
+                {"q": f"{artist} {catno}"},
+            ])
+        attempts.extend(artist_searches)
+    
+    # Priority 4: Volume/series patterns
     if "volume" in all_text or "vol" in all_text:
         vol_num = "1"  # Default
         vol_match = re.search(r'vol(?:ume)?\s*#?(\d+)', all_text)
@@ -486,7 +544,7 @@ def generate_underground_searches(lines: List[str], label: str, catno: str, arti
         ]
         attempts.extend(volume_searches)
     
-    # Priority 4: Electronic music genre patterns
+    # Priority 5: Electronic music genre patterns
     electronic_indicators = ['house', 'techno', 'acid', 'breakbeat', 'drum', 'bass', 'trance', 'hardcore']
     detected_genres = [genre for genre in electronic_indicators if genre in all_text]
     
@@ -499,20 +557,20 @@ def generate_underground_searches(lines: List[str], label: str, catno: str, arti
             ]
             attempts.extend(genre_searches)
     
-    # Priority 5: Track-based searches (important for underground records)
+    # Priority 6: Track-based searches (important for underground records)
     if tracks:
         for track in tracks[:3]:
             if len(track) > 4:
                 track_searches = [
                     {"track": track},
-                    {"track": track, "artist": "Unknown Artist"},
+                    {"track": track, "artist": artist} if artist else {"track": track, "artist": "Unknown Artist"},
                     {"track": track, "genre": "Electronic"},
                 ]
                 if label:
                     track_searches.append({"track": track, "label": label})
                 attempts.extend(track_searches)
     
-    # Priority 6: Promotional/white label indicators
+    # Priority 7: Promotional/white label indicators
     promo_indicators = ['promotional', 'promo', 'white label', 'test pressing', 'advance']
     if any(indicator in all_text for indicator in promo_indicators):
         promo_searches = []
@@ -528,19 +586,6 @@ def generate_underground_searches(lines: List[str], label: str, catno: str, arti
             {"q": "test pressing"},
         ])
         attempts.extend(promo_searches)
-    
-    # Priority 7: Artist combinations
-    if artist and catno:
-        attempts.extend([
-            {"artist": artist, "catno": catno},
-            {"artist": artist, "q": catno},
-        ])
-    
-    if artist and label:
-        attempts.extend([
-            {"artist": artist, "label": label},
-            {"artist": artist, "q": label},
-        ])
     
     # Priority 8: Fallback text searches
     clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
