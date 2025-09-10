@@ -684,3 +684,198 @@ def visual_rerank(user_img_bytes: bytes, cands: List[IdentifyCandidate]) -> List
         # For now, return original order
         return [(c, c.score or 0.0) for c in cands]
     except Exception as e:
+        logger.error(f"Visual rerank error: {e}")
+        return [(c, c.score or 0.0) for c in cands]
+
+# ---------- Main identify route ----------
+@router.post("/api/identify", response_model=IdentifyResponse)
+async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
+    """Main identification endpoint"""
+    try:
+        logger.info(f"Processing file: {file.filename}")
+        image_bytes = await file.read()
+        
+        # Vision API calls
+        v = call_vision_full(image_bytes)
+        web = v.get("webDetection", {})
+        text = v.get("textAnnotations", [])
+        
+        # Enhanced OCR processing
+        text = handwriting_merge(image_bytes, text)
+        extra = block_crop_reocr(image_bytes)
+        
+        if extra:
+            merged = [ln.strip() for ln in (text[0].get("description","").splitlines() if text else []) if ln.strip()]
+            merged.extend(extra)
+            text = [{"description":"\n".join(dict.fromkeys(merged))}]
+
+        # Web detection path
+        release_id, master_id, discogs_url = parse_discogs_web(web)
+        candidates: List[IdentifyCandidate] = []
+
+        if release_id:
+            logger.info(f"Found web match: release_id={release_id}")
+            cached = cache_get(release_id)
+            if cached:
+                candidates.append(IdentifyCandidate(
+                    source="web_cache", 
+                    release_id=release_id, 
+                    discogs_url=cached["discogs_url"],
+                    artist=cached.get("artist"), 
+                    title=cached.get("title"), 
+                    label=cached.get("label"),
+                    year=cached.get("year"), 
+                    cover_url=cached.get("cover_url"), 
+                    score=0.95
+                ))
+            else:
+                rel = fetch_discogs_release_json(release_id)
+                if rel:
+                    row = {
+                        "release_id": release_id,
+                        "discogs_url": discogs_url or rel.get("uri") or f"https://www.discogs.com/release/{release_id}",
+                        "artist": ", ".join(a.get("name","") for a in rel.get("artists",[])),
+                        "title": rel.get("title"),
+                        "label": ", ".join(l.get("name","") for l in rel.get("labels",[])),
+                        "year": str(rel.get("year") or ""),
+                        "cover_url": rel.get("thumb") or (rel.get("images") or [{}])[0].get("uri",""),
+                        "payload": rel,
+                    }
+                    cache_put(row)
+                    candidates.append(IdentifyCandidate(
+                        source="web_live", 
+                        release_id=release_id, 
+                        discogs_url=row["discogs_url"],
+                        artist=row["artist"], 
+                        title=row["title"], 
+                        label=row["label"], 
+                        year=row["year"],
+                        cover_url=row["cover_url"], 
+                        score=0.90
+                    ))
+
+        if not candidates and master_id:
+            candidates.append(IdentifyCandidate(
+                source="web_master", 
+                master_id=master_id,
+                discogs_url=f"https://www.discogs.com/master/{master_id}",
+                note="Master match — select pressing", 
+                score=0.60
+            ))
+
+        # OCR fallback - IMPROVED GENERAL APPROACH
+        if not candidates:
+            logger.info("No web matches, trying improved general OCR search")
+            lines = ocr_lines(text)
+            clean = [re.sub(r"[^\w\s/-]","",ln).strip() for ln in lines if ln.strip()]
+
+            # Use the improved general fallback
+            candidates = improved_general_ocr_fallback(text, clean)
+
+        # Visual re-ranking (if available)
+        if len(candidates) >= 2:
+            try:
+                ranked = visual_rerank(image_bytes, candidates)
+                candidates = [c for (c, _) in ranked]
+            except Exception as e:
+                logger.error(f"Visual rerank failed: {e}")
+
+        logger.info(f"Returning {len(candidates)} candidates")
+        return IdentifyResponse(candidates=candidates[:5])
+        
+    except Exception as exc:
+        logger.error(f"Identify error: {exc}")
+        raise HTTPException(500, str(exc))
+
+# ---------- Debug endpoint ----------
+@router.post("/api/debug-identify")
+async def debug_identify(file: UploadFile = File(...)):
+    """Debug endpoint to see exactly what OCR detects"""
+    try:
+        image_bytes = await file.read()
+        
+        # Basic Vision API call
+        v = call_vision_full(image_bytes)
+        web = v.get("webDetection", {})
+        text = v.get("textAnnotations", [])
+        
+        # Web detection results
+        web_urls = []
+        for key in ("pagesWithMatchingImages", "fullMatchingImages", "partialMatchingImages", "visuallySimilarImages"):
+            urls = [item.get("url") for item in web.get(key, []) if item.get("url")]
+            if urls:
+                web_urls.extend(urls[:3])
+        
+        release_id, master_id, discogs_url = parse_discogs_web(web)
+        
+        # OCR results
+        raw_ocr = text[0].get("description", "") if text else ""
+        
+        # Enhanced processing
+        text_enhanced = handwriting_merge(image_bytes, text)
+        enhanced_ocr = text_enhanced[0].get("description", "") if text_enhanced else ""
+        
+        block_lines = block_crop_reocr(image_bytes)
+        
+        final_lines = ocr_lines(text_enhanced)
+        if block_lines:
+            merged = list(dict.fromkeys([*final_lines, *block_lines]))
+            final_lines = merged
+        
+        clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in final_lines if ln.strip()]
+        
+        # Extract metadata
+        label, catno, artist, tracks = extract_general_metadata(clean_lines)
+        
+        # Test some search queries
+        test_queries = [
+            {"q": "tron 001"},
+            {"q": "tron revolta"},
+            {"q": "unknown artist tron"},
+        ]
+        
+        if label and catno:
+            test_queries.append({"label": label, "catno": catno})
+        
+        search_results = {}
+        for i, query in enumerate(test_queries):
+            try:
+                results = discogs_search(query)
+                search_results[f"query_{i}"] = {
+                    "query": query,
+                    "count": len(results),
+                    "results": [{"artist": r.artist, "title": r.title, "url": r.discogs_url} for r in results[:3]]
+                }
+            except Exception as e:
+                search_results[f"query_{i}"] = {"query": query, "error": str(e)}
+        
+        return {
+            "raw_ocr": raw_ocr,
+            "enhanced_ocr": enhanced_ocr,
+            "block_reocr": block_lines,
+            "final_lines": final_lines,
+            "cleaned_lines": clean_lines,
+            "extracted_metadata": {
+                "label": label,
+                "catno": catno, 
+                "artist": artist,
+                "tracks": tracks
+            },
+            "web_detection": {
+                "release_id": release_id,
+                "master_id": master_id,
+                "discogs_url": discogs_url,
+                "sample_urls": web_urls
+            },
+            "search_results": search_results,
+            "system_info": {
+                "vision_key_set": bool(VISION_KEY),
+                "discogs_token_set": bool(os.environ.get("DISCOGS_TOKEN")),
+                "supabase_available": supabase is not None,
+                "clip_available": CLIP_AVAILABLE,
+            }
+        }
+        
+    except Exception as exc:
+        logger.error(f"Debug identify error: {exc}")
+        return {"error": str(exc)}
