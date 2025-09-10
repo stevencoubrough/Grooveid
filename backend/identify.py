@@ -57,6 +57,7 @@ def discogs_request(path: str, params: Dict = None, timeout=20):
     return requests.get(url, headers=headers, params=params, timeout=timeout)
 
 # ================== HELPERS: VISION ==================
+
 def call_vision_api(image_bytes: bytes) -> dict:
     if not VISION_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY not set")
@@ -92,6 +93,7 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
     if not release_id:
         for u in urls:
             m = RE_MASTER.search(u)
+
             if m:
                 master_id = int(m.group(1)); discogs_url = u; break
     return release_id, master_id, discogs_url, urls
