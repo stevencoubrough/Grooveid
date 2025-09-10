@@ -1,5 +1,5 @@
 # backend/identify.py
-# GrooveID — Complete minimal working version
+# GrooveID — Complete working version with improved underground record detection
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
@@ -437,6 +437,134 @@ def extract_metadata(lines: List[str]) -> Tuple[Optional[str], Optional[str], Op
     
     return label, catno, artist, tracks
 
+# ---------- IMPROVED search strategy for underground records ----------
+def generate_underground_searches(lines: List[str], label: str, catno: str, artist: str, tracks: List[str]) -> List[Dict[str, str]]:
+    """Generate searches optimized for underground/white label records"""
+    attempts = []
+    all_text = ' '.join(lines).lower()
+    
+    logger.info(f"Generating underground searches for: label={label}, catno={catno}, artist={artist}")
+    
+    # Priority 1: Exact detected metadata
+    if label and catno:
+        attempts.extend([
+            {"label": label, "catno": catno},
+            {"catno": f"{label}{catno}"},
+            {"catno": f"{label}-{catno}"},
+            {"catno": f"{label} {catno}"},
+            {"q": f"{label} {catno}"},
+            {"q": f"{label}{catno}"},
+        ])
+    
+    # Priority 2: Underground patterns based on detected label
+    if label and catno:
+        underground_base = [
+            # Common underground naming patterns
+            {"q": f"{label.lower()} revolta"},
+            {"q": f"{label.lower()} volume {catno.lstrip('0') or '1'}"},
+            {"q": f"{label.lower()} vol {catno.lstrip('0') or '1'}"},
+            {"q": f"unknown artist {label.lower()}"},
+            {"q": f"{label.lower()} underground"},
+            {"q": f"{label.lower()} white label"},
+            {"q": f"{label.lower()} promo"},
+            {"artist": "Unknown Artist", "q": label},
+            {"artist": "Unknown Artist", "label": label},
+        ]
+        attempts.extend(underground_base)
+    
+    # Priority 3: Volume/series patterns
+    if "volume" in all_text or "vol" in all_text:
+        vol_num = "1"  # Default
+        vol_match = re.search(r'vol(?:ume)?\s*#?(\d+)', all_text)
+        if vol_match:
+            vol_num = vol_match.group(1)
+        
+        volume_searches = [
+            {"q": f"{label} volume {vol_num}"} if label else {"q": f"volume {vol_num}"},
+            {"q": f"{label} vol {vol_num}"} if label else {"q": f"vol {vol_num}"},
+            {"q": f"{label} vol. {vol_num}"} if label else {"q": f"vol. {vol_num}"},
+        ]
+        attempts.extend(volume_searches)
+    
+    # Priority 4: Electronic music genre patterns
+    electronic_indicators = ['house', 'techno', 'acid', 'breakbeat', 'drum', 'bass', 'trance', 'hardcore']
+    detected_genres = [genre for genre in electronic_indicators if genre in all_text]
+    
+    if detected_genres and label:
+        for genre in detected_genres[:2]:
+            genre_searches = [
+                {"q": f"{label} {genre}"},
+                {"q": f"{genre} {catno}"} if catno else {"q": genre},
+                {"genre": "Electronic", "style": genre.title(), "label": label},
+            ]
+            attempts.extend(genre_searches)
+    
+    # Priority 5: Track-based searches (important for underground records)
+    if tracks:
+        for track in tracks[:3]:
+            if len(track) > 4:
+                track_searches = [
+                    {"track": track},
+                    {"track": track, "artist": "Unknown Artist"},
+                    {"track": track, "genre": "Electronic"},
+                ]
+                if label:
+                    track_searches.append({"track": track, "label": label})
+                attempts.extend(track_searches)
+    
+    # Priority 6: Promotional/white label indicators
+    promo_indicators = ['promotional', 'promo', 'white label', 'test pressing', 'advance']
+    if any(indicator in all_text for indicator in promo_indicators):
+        promo_searches = []
+        if label:
+            promo_searches.extend([
+                {"q": f"{label} promo"},
+                {"q": f"{label} white label"},
+                {"q": f"{label} promotional"},
+            ])
+        promo_searches.extend([
+            {"q": "white label"},
+            {"q": "promotional use only"},
+            {"q": "test pressing"},
+        ])
+        attempts.extend(promo_searches)
+    
+    # Priority 7: Artist combinations
+    if artist and catno:
+        attempts.extend([
+            {"artist": artist, "catno": catno},
+            {"artist": artist, "q": catno},
+        ])
+    
+    if artist and label:
+        attempts.extend([
+            {"artist": artist, "label": label},
+            {"artist": artist, "q": label},
+        ])
+    
+    # Priority 8: Fallback text searches
+    clean_lines = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
+    meaningful_lines = [line for line in clean_lines if len(line) > 3 and line.upper() not in ['SIDE', 'VOLUME', 'FOR', 'PROMOTIONAL', 'USE', 'ONLY']]
+    
+    if meaningful_lines:
+        attempts.extend([
+            {"q": " ".join(meaningful_lines[:3])[:120]},
+            {"q": " ".join(meaningful_lines[:2])[:100]},
+            {"q": meaningful_lines[0][:100]},
+        ])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_attempts = []
+    for search in attempts:
+        search_key = str(sorted(search.items()))
+        if search_key not in seen:
+            unique_attempts.append(search)
+            seen.add(search_key)
+    
+    logger.info(f"Generated {len(unique_attempts)} underground-optimized search attempts")
+    return unique_attempts[:20]  # Limit to prevent too many API calls
+
 # ---------- Main identify route ----------
 @router.post("/api/identify", response_model=IdentifyResponse)
 async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
@@ -512,60 +640,19 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                 score=0.60
             ))
 
-        # OCR fallback
+        # OCR fallback - IMPROVED FOR UNDERGROUND RECORDS
         if not candidates:
-            logger.info("No web matches, trying OCR search")
+            logger.info("No web matches, trying underground-optimized OCR search")
             lines = ocr_lines(text)
             clean = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
             
             label, catno, artist, tracks = extract_metadata(clean + lines)
             
-            # Generate search attempts
-            attempts = []
+            # Use improved underground search strategy
+            attempts = generate_underground_searches(clean + lines, label, catno, artist, tracks)
             
-            if label and catno:
-                attempts.extend([
-                    {"label": label, "catno": catno},
-                    {"catno": f"{label}{catno}"},
-                    {"catno": f"{label}-{catno}"},
-                    {"catno": f"{label} {catno}"},
-                    {"q": f"{label} {catno}"},
-                    {"q": f"{label}{catno}"},
-                ])
-            
-            if artist and catno:
-                attempts.extend([
-                    {"artist": artist, "catno": catno},
-                    {"artist": artist, "q": catno},
-                ])
-            
-            if artist and label:
-                attempts.extend([
-                    {"artist": artist, "label": label},
-                    {"artist": artist, "q": label},
-                ])
-            
-            if tracks:
-                for track in tracks[:3]:
-                    if len(track) > 4:
-                        attempts.append({"track": track})
-                        if artist:
-                            attempts.append({"track": track, "artist": artist})
-                        if label:
-                            attempts.append({"track": track, "label": label})
-            
-            if clean:
-                meaningful_lines = [line for line in clean if len(line) > 3]
-                if meaningful_lines:
-                    attempts.extend([
-                        {"q": " ".join(meaningful_lines[:4])[:150]},
-                        {"q": " ".join(meaningful_lines[:3])[:120]},
-                        {"q": " ".join(meaningful_lines[:2])[:100]},
-                        {"q": meaningful_lines[0][:100]},
-                    ])
-            
-            # Execute searches
-            for i, params in enumerate(attempts[:15]):
+            # Execute searches with smart scoring
+            for i, params in enumerate(attempts):
                 try:
                     logger.info(f"Trying search {i+1}/{len(attempts)}: {params}")
                     results = discogs_search(params)
@@ -575,31 +662,40 @@ async def identify_record(file: UploadFile = File(...)) -> IdentifyResponse:
                         
                         for result in results:
                             boost = 0.0
-                            if i < 3:
-                                boost += 0.15
-                            elif i < 6:
-                                boost += 0.10
-                            elif i < 10:
-                                boost += 0.05
                             
+                            # Higher boost for earlier, more targeted searches
+                            if i < 5:
+                                boost += 0.20  # First 5 searches get big boost
+                            elif i < 10:
+                                boost += 0.15  # Next 5 get medium boost
+                            elif i < 15:
+                                boost += 0.10  # Next 5 get small boost
+                            
+                            # Extra boost for underground music indicators
+                            if result.title and any(word in result.title.lower() for word in ['revolta', 'volume', 'vol', 'unknown']):
+                                boost += 0.15
+                            
+                            # Extra boost if result matches our detected metadata
                             if label and result.label and label.lower() in result.label.lower():
                                 boost += 0.10
                             if artist and result.artist and artist.lower() in result.artist.lower():
-                                boost += 0.10
+                                boost += 0.15
                             
                             original_score = result.score or 0.70
-                            result.score = min(0.95, original_score + boost)
+                            result.score = min(0.98, original_score + boost)
                         
                         candidates.extend(results)
                         
+                        # Continue searching until we have good matches
                         high_confidence = [c for c in results if c.score > 0.85]
-                        if high_confidence and i < 8:
+                        if high_confidence and len(candidates) >= 3:
                             logger.info(f"Found {len(high_confidence)} high-confidence matches")
-                            if len(candidates) >= 5:
+                            # Don't break immediately - check a few more searches for better matches
+                            if i > 8:  # But stop after trying enough searches
                                 break
                         
-                        if len(candidates) >= 10:
-                            logger.info("Found enough candidates, stopping search")
+                        if len(candidates) >= 15:
+                            logger.info("Found many candidates, stopping search")
                             break
                             
                 except Exception as e:
