@@ -18,7 +18,8 @@ DISCOGS_API = "https://api.discogs.com"
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN", "").strip()
 
 # ---- local dump (optional) ----
-LOCAL_TABLE = os.environ.get("DISCOGS_LOCAL_TABLE", "discogs_local")  # label/catno/artist/title/release_id
+# Default to 'records' since your Supabase dump uses this table
+LOCAL_TABLE = os.environ.get("DISCOGS_LOCAL_TABLE", "records")  # label/catalog_no/artist/title/release_id
 
 # ================== REGEX ==================
 RE_RELEASE = re.compile(r"discogs\.com/(?:[^/]+/)?release/(\d+)", re.I)
@@ -93,7 +94,6 @@ def parse_discogs_web_detection(web: dict) -> Tuple[Optional[int], Optional[int]
     if not release_id:
         for u in urls:
             m = RE_MASTER.search(u)
-
             if m:
                 master_id = int(m.group(1)); discogs_url = u; break
     return release_id, master_id, discogs_url, urls
@@ -119,12 +119,12 @@ def local_lookup(label: Optional[str], catno: Optional[str], artist: Optional[st
         return out
     try:
         t0 = time.time()
-        # exact label+catno
+        # exact-ish label + catalog_no (use ILIKE with wildcards for label)
         res = (
             sb.table(LOCAL_TABLE)
-              .select("release_id, label, catno, artist, title")
-              .ilike("label", norm_label(label))
-              .ilike("catno", norm_catno(catno))
+              .select("release_id, label, catalog_no, artist, title")
+              .ilike("label", f"%{label.strip()}%")
+              .ilike("catalog_no", norm_catno(catno))
               .limit(10)
               .execute()
         )
@@ -133,14 +133,15 @@ def local_lookup(label: Optional[str], catno: Optional[str], artist: Optional[st
             "rows": len(res.data or []), "elapsed_ms": int((time.time()-t0)*1000)
         })
         rows = res.data or []
-        # if no rows, try artist+catno
+
+        # artist + catalog_no fallback
         if not rows and artist:
             t1 = time.time()
             res2 = (
                 sb.table(LOCAL_TABLE)
-                  .select("release_id, label, catno, artist, title")
+                  .select("release_id, label, catalog_no, artist, title")
                   .ilike("artist", f"%{artist}%")
-                  .ilike("catno", norm_catno(catno))
+                  .ilike("catalog_no", norm_catno(catno))
                   .limit(10)
                   .execute()
             )
@@ -381,9 +382,7 @@ async def identify_record(
                 if local_cands:
                     candidates.extend(local_cands)
                 else:
-                    # 4b) Structured Discogs search
-                    #    (label+catno → artist+catno → track(+artist) → release_title → q=…)
-                    # Build fallback text queries for debug as well:
+                    # 4b) Structured Discogs search (label+catno → artist+catno → track → title → q)
                     queries = []
                     if clean_lines:
                         queries.append(" ".join(clean_lines[:3])[:200])
@@ -396,7 +395,6 @@ async def identify_record(
 
                     cands = discogs_multi_search(label, catno, artist_hint, tracks, strong_title, dbg if debug else {})
                     if not cands:
-                        # final hail-mary on text
                         for q in queries:
                             cands = search_discogs_via_ocr(q, dbg if debug else {})
                             if cands:
@@ -411,4 +409,5 @@ async def identify_record(
 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
 
