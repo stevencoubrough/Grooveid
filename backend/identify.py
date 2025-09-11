@@ -554,29 +554,98 @@ async def identify_record(
                         "strong_title": strong_title,
                     }
                 # 4a) Local database lookup
-                local_candidates = local_lookup(label_hint, catalog_no_hint, artist_hint, dbg if debug else {})
-                if local_candidates:
-                    candidates.extend(local_candidates)
-                else:
-                    # 4b) Discogs searches based on extracted hints
-                    # Build fallback queries for debug logging
-                    queries = []
-                    if clean_lines:
-                        queries.append(" ".join(clean_lines[:3])[:200])
-                        if len(clean_lines) >= 2:
-                            queries.append(" ".join(clean_lines[:2])[:200])
+     #### #          local_candidates = local_lookup(label_hint, catalog_no_hint, artist_hint, dbg if debug else {})
+    #   
+         # --- Build OCR signals from your existing extraction ---
+        signals = {
+            "p_catno":   (catalog_no_hint or "").upper().strip(),
+            "p_label":   (label_hint or "").strip(),
+            "p_artist":  (artist_hint or "").strip(),
+            "p_title":   (strong_title or "").strip(),
+        }
+
+        # Skip copyright rim title if necessary
+        if signals["p_title"].lower().startswith("all rights of the manufacturer"):
+            signals["p_title"] = ""
+
+        # Infer common labels if OCR missed 'Records'
+        if not signals["p_label"]:
+            for ln in clean_lines:
+                if "evasive" in ln.lower():
+                    signals["p_label"] = "Evasive Records"
+                    break
+
+        # --- Supabase composite search ---
+        rpc_start = time.time()
+        res = sb.rpc("search_records", signals).execute()
+        rows = res.data or []
+        dbg.setdefault("local_calls", []).append({
+            "rpc": "search_records",
+            "params": signals,
+            "rows": len(rows),
+            "elapsed_ms": int((time.time() - rpc_start) * 1000)
+        })
+
+        def parse_release_id(url: Optional[str]) -> Optional[int]:
+            if not url:
+                return None
+            m = re.search(r"/release/(\\d+)", url)
+            return int(m.group(1)) if m else None
+
+        if rows:
+            for r in rows[:5]:
+                rid = r.get("release_id") or parse_release_id(r.get("discogs_url"))
+                if not rid:
+                    continue
+                candidates.append(IdentifyCandidate(
+                    source="local_dump",
+                    release_id=rid,
+                    discogs_url=f"https://www.discogs.com/release/{rid}",
+                    artist=r.get("artist"),
+                    title=r.get("title"),
+                    label=r.get("label"),
+                    year=None,
+                    cover_url=None,
+                    score=float(r.get("score", 0.92))
+                ))
+        else:
+            # Fallback to your existing Discogs search strategy only if Supabase found nothing
+            cands = discogs_multi_search(label_hint, catalog_no_hint, artist_hint, track_hints, strong_title, dbg if debug else {})
+            if not cands:
+                # hail-mary generic OCR queries
+                for q in [" ".join(clean_lines[:3])[:200],
+                          " ".join(clean_lines[:2])[:200],
+                          (clean_lines[0] if clean_lines else "")[:200]]:
+                    if not q:
+                        continue
+                    cands = search_discogs_via_ocr(q, dbg if debug else {})
+                    if cands:
+                        break
+            if cands:
+                candidates.extend(cands)
+
+#if local_candidates:
+      #              candidates.extend(local_candidates)
+      #          else:
+      #              # 4b) Discogs searches based on extracted hints
+      #              # Build fallback queries for debug logging
+      #              queries = []
+      #              if clean_lines:
+      #                  queries.append(" ".join(clean_lines[:3])[:200])
+  #    #                  if len(clean_lines) >= 2:
+      #                      queries.append(" ".join(clean_lines[:2])[:200])
                         queries.append(clean_lines[0][:200])
-                    else:
-                        queries.append(" ".join(lines[:2])[:200])
-                    if debug:
-                        dbg["queries_tried"] = queries
-                    # Perform structured Discogs searches
-                    cands = discogs_multi_search(label_hint, catalog_no_hint, artist_hint, track_hints, strong_title, dbg if debug else {})
-                    if not cands:
-                        for q in queries:
-                            cands = search_discogs_via_ocr(q, dbg if debug else {})
-                            if cands:
-                                break
+#                    else:
+      #                  queries.append(" ".join(lines[:2])[:200])
+      #              if debug:
+      #                  dbg["queries_tried"] = queries
+      ##              # Perform structured Discogs searches
+      #              cands = discogs_multi_search(label_hint, catalog_no_hint, artist_hint, track_hints, strong_title, dbg if debug else {})
+      #              if not cands:
+      #                  for q in queries:
+      #                      cands = search_discogs_via_ocr(q, dbg if debug else {})
+      #                      if cands:
+      #                          break
                     if cands:
                         candidates.extend(cands)
         # Compose response
