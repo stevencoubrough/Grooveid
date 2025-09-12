@@ -218,12 +218,15 @@ RIM_PREFIX_RE = re.compile(r"^all rights of the manufacturer", re.I)
 def join_broken_tracks(lines: List[str]) -> List[str]:
     """
     Join lines where a track title is broken across multiple OCR lines.  Many
-    white‑label scans split track titles over two lines, e.g. "AL. BEHIND" then
-    "THE WHEEL".  We only treat lines that begin with a side/track prefix
-    starting with the letters 'A' or 'B' as candidates for joining.  The
-    prefix may include an optional additional letter or digit (e.g., "AL",
-    "A1", "B2"), an optional dot, and optional whitespace.  Other lines
-    (e.g., "SIDE", "TRON", etc.) should not be modified here.
+    white‑label scans split track titles over two lines, e.g. ``"A1. BEHIND"``
+    then ``"THE WHEEL"``.  We only treat lines that begin with a side/track
+    prefix starting with the letters ``A`` or ``B`` followed by at most one
+    *digit* and optional punctuation (``.``, ``:``) as candidates for joining.
+
+    This avoids matching arbitrary two‑letter words beginning with ``B`` (such
+    as ``"BEST"``), which previously caused characters to be stripped from
+    legitimate track names.  Other lines (e.g. ``"SIDE"``, ``"TRON"``,
+    ``"PROMO"``) are left untouched.
     """
     result: List[str] = []
     skip = False
@@ -231,21 +234,18 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
         if skip:
             skip = False
             continue
-        # Consider prefixes that start with A or B followed by at most one
-        # alphanumeric character and optional dot.  Do not match arbitrary
-        # two-letter prefixes like 'SI' from "SIDE" or 'TR' from "TRON".
-        if re.match(r"^[AB][A-Za-z0-9]?\.?\s*", ln):
-            # Remove the detected prefix and any whitespace following it.
-            title = re.sub(r"^[AB][A-Za-z0-9]?\.?\s*", "", ln).strip()
-            # Join with the next line if the remainder is empty and the next
-            # line exists.  This handles cases where the first line is just
-            # the prefix.
+        # Match side/track prefixes: A or B followed by an optional digit,
+        # optional dot or colon, and whitespace.  Do NOT match words that
+        # begin with A or B followed by a letter (e.g. "BEST").
+        if re.match(r"^[AB]\d?[.:]?\s*", ln):
+            title = re.sub(r"^[AB]\d?[.:]?\s*", "", ln).strip()
+            # If the remainder is empty, take the next non-empty line as the title.
             if not title and i + 1 < len(lines) and lines[i + 1].strip():
                 title = lines[i + 1].strip()
                 skip = True
-            # If there is non-empty remainder and the next line looks like
-            # part of the title (starts with an uppercase letter or digit),
-            # append it.  This helps join cases like "AL. BEHIND" + "THE WHEEL".
+            # If there is a remainder and the next line looks like a continuation
+            # (starts with a letter or digit), append it.  This helps join
+            # cases like "A1. BEHIND" + "THE WHEEL".
             elif title and i + 1 < len(lines) and re.match(r"^[A-Za-z0-9]", lines[i + 1]):
                 title = f"{title} {lines[i + 1].strip()}".strip()
                 skip = True
@@ -549,40 +549,57 @@ async def identify_api(
                     if re.search(r"(records|recordings|music)\b", ln, re.I):
                         label_hint = re.sub(r"(records|recordings|music)\b", "", ln, flags=re.I).strip()
                         break
-                # Artist: short all‑caps line (<=3 words) that does not look like a side
-                # marker or volume indicator.  Skip lines containing words such as
-                # "SIDE" or "VOLUME" (case‑insensitive) because these are layout
-                # markers, not artist names.
+                # Artist: find an uppercase line that looks like a name.  We
+                # require the line to contain at least two words OR a single
+                # word longer than three letters, and all alphabetic characters
+                # must be uppercase.  Skip common layout markers like "SIDE"
+                # or "VOLUME" and discard one‑letter lines such as "R".
                 for ln in clean:
                     words = ln.split()
-                    if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
-                        if not re.search(r"\b(side|volume)\b", ln, re.I):
-                            artist_hint = ln.title()
-                            break
-                # Tracks: look for lines that define track titles.  We
-                # recognise three patterns:
-                #   1. Side prefixes like "A1." or "B2:" (with optional digit and punctuation).
-                #   2. Numeric prefixes like "1." or "02:".
-                #   3. Colon‑separated lines prefaced with HERE or THERE.  For
-                #      example, "HERE: Tech‑House is Dead." yields the track
-                #      "Tech‑House is Dead.".
+                    # Skip if the line contains side or volume markers.
+                    if re.search(r"\b(side|volume)\b", ln, re.I):
+                        continue
+                    # Determine if the line is fully uppercase (ignoring non‑alpha characters).
+                    if words:
+                        if len(words) >= 2 or (len(words) == 1 and len(re.sub(r"[^A-Za-z]", "", words[0])) > 3):
+                            if all(w.isalpha() and w.isupper() for w in words):
+                                artist_hint = ln.title()
+                                break
+                # Tracks: extract all plausible track titles.  We
+                # recognise several patterns:
+                #   1. Colon‑separated lines prefaced with HERE or THERE: e.g.
+                #      "HERE: Tech‑House is Dead." → "Tech‑House is Dead."
+                #   2. Side prefixes like "A1.", "B2:" (with optional digit and punctuation).
+                #   3. Numeric prefixes like "1." or "02:".
+                #   4. Multi‑word uppercase lines (e.g. "NINA KRAVIZ", "BEST FRIEND",
+                #      "DVS1 DUB TEST FEAT.", "NAUGHTY WOOD").  We treat these as
+                #      track candidates so they contribute to the Google query.
                 for ln in clean:
-                    # Skip empty lines
                     if not ln.strip():
                         continue
                     candidate: Optional[str] = None
                     low = ln.lower()
-                    # 3. Colon separated lines: HERE: Title or THERE: Title
+                    # Pattern 1: HERE/THERE prefixes
                     if ":" in ln:
                         prefix, suffix = ln.split(":", 1)
                         if prefix.strip().lower() in {"here", "there"} and suffix.strip():
                             candidate = suffix.strip()
-                    # 1. Side prefixes: A/B with optional number and dot/colon
+                    # Pattern 2: A/B side prefixes
                     if candidate is None and re.match(r"^[ab][0-9]?[.:]?\s*", low):
                         candidate = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
-                    # 2. Numeric prefixes: 1., 01:, etc.
+                    # Pattern 3: Numeric prefixes
                     if candidate is None and re.match(r"^\d+[.:]?\s*", low):
                         candidate = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
+                    # Pattern 4: Multi‑word uppercase lines (two or more words)
+                    if candidate is None:
+                        words = ln.split()
+                        # At least two words and not a website/URL (ignore lines containing dots or www)
+                        if (
+                            len(words) >= 2
+                            and all(re.search(r"[A-Z]", w) for w in words)
+                            and not re.match(r"^www|http", ln.lower())
+                        ):
+                            candidate = ln.strip()
                     if candidate:
                         tracks.append(candidate)
                 # Filter out tracks that are just identifiers (e.g. 'A2') or too short.
