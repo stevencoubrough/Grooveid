@@ -216,10 +216,11 @@ RIM_PREFIX_RE = re.compile(r"^all rights of the manufacturer", re.I)
 
 def join_broken_tracks(lines: List[str]) -> List[str]:
     """
-    Join lines where a track title is broken across multiple OCR lines.  For
-    example, "AL. BEHIND" followed by "THE WHEEL" becomes "Behind The Wheel".
-    We detect a short alphabetic prefix ending with a dot and join it with
-    the next line.
+    Join lines where a track title is broken across multiple OCR lines.  Many
+    white‑label scans split track titles over two lines, e.g. "AL. BEHIND" then
+    "THE WHEEL".  We detect a prefix consisting of one or two letters (A/B)
+    followed optionally by a digit and an optional dot.  The prefix may or may
+    not be followed by whitespace because some OCR outputs strip the dot.
     """
     result: List[str] = []
     skip = False
@@ -227,13 +228,17 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
         if skip:
             skip = False
             continue
-        # Recognise a prefix like "A1.", "A.", "B.": letters+optional digit+dot
-        if re.match(r"^[A-Za-z]{1,2}\d?\.\s*", ln):
-            title = re.sub(r"^[A-Za-z]{1,2}\d?\.\s*", "", ln).strip()
-            if i + 1 < len(lines):
-                title = f"{title} {lines[i + 1].strip()}"
+        # Recognise a prefix like "A1.", "A.", "AL.", "A1", "AL" etc.
+        # Allow optional digit and optional dot and optional whitespace.
+        if re.match(r"^[A-Za-z]{1,2}\d?\.?\s*", ln):
+            # Remove the prefix of letters/digit/dot and any whitespace.
+            title = re.sub(r"^[A-Za-z]{1,2}\d?\.?\s*", "", ln).strip()
+            # If the title is empty and a next line exists, join with it.  This
+            # handles cases where the first line is just a prefix.
+            if i + 1 < len(lines) and lines[i + 1].strip():
+                title = f"{title} {lines[i + 1].strip()}".strip()
                 skip = True
-            result.append(title)
+            result.append(title.strip())
         else:
             result.append(ln)
     return result
@@ -503,10 +508,12 @@ async def identify_api(
             if debug:
                 dbg["ocr_lines_raw"] = lines[:200]
             if lines:
-                # Clean lines: keep digits, hyphens, slashes; strip other punctuation
+                # Clean lines: remove extraneous punctuation but keep dots and colons.
+                # We keep '.' and ':' so that track prefixes like "AL." and "2."
+                # survive long enough for join_broken_tracks and track extraction.
                 clean: List[str] = []
                 for ln in lines:
-                    cleaned = re.sub(r"[^\w\s/-]", "", ln).strip()
+                    cleaned = re.sub(r"[^\w\s./:-]", "", ln).strip()
                     if cleaned:
                         clean.append(cleaned)
                 # Join broken track names
@@ -537,17 +544,28 @@ async def identify_api(
                     if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
                         artist_hint = ln.title()
                         break
-                # Tracks: look for A/B prefix or numeric prefix
+                # Tracks: look for A/B prefix or numeric prefix.  Keep only
+                # descriptive titles (not just 'A1' or 'B2').
                 for ln in clean:
                     low = ln.lower()
+                    # Remove side/track prefixes
                     if re.match(r"^[ab][0-9]?[.:]?\s*", low):
                         track = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
-                        if track:
-                            tracks.append(track)
                     elif re.match(r"^\d+[.:]?\s*", low):
                         track = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
-                        if track:
-                            tracks.append(track)
+                    else:
+                        track = None
+                    if track:
+                        tracks.append(track)
+                # Filter out tracks that are just identifiers (e.g. 'A2')
+                filtered_tracks: List[str] = []
+                for ttrack in tracks:
+                    words = [w for w in re.split(r"\s+", ttrack) if w]
+                    # Keep if any word has >2 alphabetic characters
+                    keep = any(len(re.sub(r"[^A-Za-z]", "", w)) > 2 for w in words)
+                    if keep:
+                        filtered_tracks.append(ttrack)
+                tracks = filtered_tracks
                 # Strong title: first non‑rim, non‑side marker line or first track
                 strong_title: Optional[str] = None
                 for ln in clean:
