@@ -1,21 +1,31 @@
 
+"""identify_with_rpc.py
+
+Drop-in FastAPI module for GrooveID:
+- Google Vision Web Detection + Text/Document OCR (good for graffiti/handwriting)
+- Google CSE ranking (site:discogs.com)
+- Supabase RPC fallback: calls `search_records(p_catno, p_label, p_artist, p_title)`
+  (you must create this RPC in your Supabase DB; SQL snippet included below)
+- Discogs structured fallback
+- Debug logging via ?debug=true
+"""
+
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Tuple, Dict, Any
 import os, re, base64, time, requests
 
-# ===================== ENV =====================
+# ----------------- ENV -----------------
 VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
 VISION_KEY = os.environ.get("GOOGLE_VISION_API_KEY", "").strip()
 
 DISCOGS_API = "https://api.discogs.com"
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN", "").strip()
 
-# Google Programmable Search (CSE)
 GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "").strip()
 GOOGLE_CSE_ID        = os.environ.get("GOOGLE_CSE_ID", "").strip()
 
-# Optional Supabase local dump (records table with catalog_no)
+# Supabase client (optional)
 try:
     from supabase import create_client, Client  # type: ignore
     SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -28,7 +38,7 @@ LOCAL_TABLE = os.environ.get("DISCOGS_LOCAL_TABLE", "records")
 
 router = APIRouter()
 
-# ===================== MODELS =====================
+# ----------------- MODELS -----------------
 class IdentifyCandidate(BaseModel):
     source: str
     release_id: Optional[int] = None
@@ -44,9 +54,9 @@ class IdentifyCandidate(BaseModel):
 
 class IdentifyResponse(BaseModel):
     candidates: List[IdentifyCandidate]
-    debug: Optional[Dict[str, Any]] = None  # returned when ?debug=true
+    debug: Optional[Dict[str, Any]] = None
 
-# ===================== HELPERS =====================
+# ----------------- HELPERS -----------------
 def discogs_request(path: str, params: Dict = None, timeout=20) -> requests.Response:
     if params is None:
         params = {}
@@ -57,7 +67,7 @@ def discogs_request(path: str, params: Dict = None, timeout=20) -> requests.Resp
     url = path if path.startswith("http") else f"{DISCOGS_API}{path}"
     return requests.get(url, headers=headers, params=params, timeout=timeout)
 
-def call_vision_api(image_bytes: bytes) -> dict:
+def call_vision(image_bytes: bytes) -> dict:
     if not VISION_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY not set")
     b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -67,8 +77,12 @@ def call_vision_api(image_bytes: bytes) -> dict:
             "features": [
                 {"type": "WEB_DETECTION", "maxResults": 10},
                 {"type": "TEXT_DETECTION", "maxResults": 5},
+                {"type": "DOCUMENT_TEXT_DETECTION"},
             ],
-            "imageContext": {"webDetectionParams": {"includeGeoResults": True}},
+            "imageContext": {
+                "webDetectionParams": {"includeGeoResults": True},
+                "languageHints": ["en","fr","de","es","ru"]
+            },
         }]
     }
     r = requests.post(f"{VISION_ENDPOINT}?key={VISION_KEY}", json=payload, timeout=30)
@@ -85,30 +99,46 @@ def parse_web(web: dict) -> Tuple[Optional[int], Optional[int], Optional[str], L
     release_id = master_id = None
     discogs_url = None
     for u in urls:
-        m = re.search(r"discogs\.com/(?:[^/]+/)?release/(\d+)", u, re.I)
+        m = re.search(r"discogs\\.com/(?:[^/]+/)?release/(\\d+)", u, re.I)
         if m:
             release_id = int(m.group(1)); discogs_url = u; break
     if not release_id:
         for u in urls:
-            m = re.search(r"discogs\.com/(?:[^/]+/)?master/(\d+)", u, re.I)
+            m = re.search(r"discogs\\.com/(?:[^/]+/)?master/(\\d+)", u, re.I)
             if m:
                 master_id = int(m.group(1)); discogs_url = u; break
     return release_id, master_id, discogs_url, urls
 
-def ocr_lines(text_annotations: List[dict]) -> List[str]:
-    if not text_annotations: return []
-    raw = text_annotations[0].get("description","")
-    return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+def merge_google_ocr(resp: dict) -> List[str]:
+    lines: List[str] = []
+    fta = resp.get("fullTextAnnotation") or {}
+    txt = fta.get("text")
+    if txt:
+        lines.extend([ln.strip() for ln in txt.splitlines() if ln.strip()])
+    for t in resp.get("textAnnotations", [])[1:]:
+        d = t.get("description")
+        if d:
+            lines.extend([ln.strip() for ln in d.splitlines() if ln.strip()])
+    out: List[str] = []
+    seen = set()
+    for ln in lines:
+        key = ln.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(ln)
+    return out[:130]
+
+def ocr_lines(resp: dict) -> List[str]:
+    return merge_google_ocr(resp)
 
 def norm_catno(s: Optional[str]) -> Optional[str]:
     if not s: return None
     s = s.upper().strip()
-    s = re.sub(r"\s*-\s*", "-", s)
-    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\\s*-\\s*", "-", s)
+    s = re.sub(r"\\s+", " ", s)
     return s
 
 def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, str]) -> Optional[str]:
-    """Return best Discogs URL using Google CSE, or None."""
     api = GOOGLE_SEARCH_API_KEY
     cx  = GOOGLE_CSE_ID
     if not api or not cx or not query:
@@ -124,16 +154,13 @@ def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, str]) -> Option
     })
     if r.status_code != 200 or not r.json().get("items"):
         return None
-
     best, best_score = None, -1.0
     cat = (signals.get("p_catno")  or "").lower()
     art = (signals.get("p_artist") or "").lower()
     ttl = (signals.get("p_title")  or "").lower()
-
     for item in r.json().get("items", []):
         link = item.get("link","")
-        if "discogs.com" not in link:
-            continue
+        if "discogs.com" not in link: continue
         title = (item.get("title")   or "").lower()
         snip  = (item.get("snippet") or "").lower()
         corpus = title + " " + snip
@@ -147,57 +174,64 @@ def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, str]) -> Option
             best_score, best = score, link
     return best
 
-# ===================== Supabase (optional) =====================
+# ----------------- Supabase RPC -----------------
+def rpc_search_records(signals: Dict[str, str], dbg: Dict) -> List[Dict[str, Any]]:
+    """
+    Calls Supabase RPC `search_records(p_catno, p_label, p_artist, p_title)`.
+    The RPC should return rows with fields: release_id, catalog_no, label, artist, title, discogs_url, score
+    """
+    out: List[Dict[str, Any]] = []
+    if not sb:
+        dbg.setdefault("local_calls", []).append({"rpc": "skipped_no_client"})
+        return out
+    try:
+        t0 = time.time()
+        # Note: supabase-py RPC signature expects named args as a dict
+        res = sb.rpc("search_records", {
+            "p_catno": signals.get("p_catno") or None,
+            "p_label": signals.get("p_label") or None,
+            "p_artist": signals.get("p_artist") or None,
+            "p_title": signals.get("p_title") or None,
+        }).execute()
+        rows = res.data or []
+        dbg.setdefault("local_calls", []).append({"rpc": "search_records", "rows": len(rows), "elapsed_ms": int((time.time()-t0)*1000)})
+        return rows
+    except Exception as e:
+        dbg.setdefault("local_calls", []).append({"rpc_error": str(e)})
+        return out
+
+# ----------------- Local fallback (legacy) -----------------
 def local_lookup(catno: Optional[str], label: Optional[str], artist: Optional[str], dbg: Dict) -> List[IdentifyCandidate]:
     out: List[IdentifyCandidate] = []
     if not sb or not catno:
         return out
     try:
-        # 1) catalog_no only
-        t0 = time.time()
         res0 = (sb.table(LOCAL_TABLE)
                   .select("release_id,label,catalog_no,artist,title,discogs_url")
                   .ilike("catalog_no", norm_catno(catno) or "")
                   .limit(12).execute())
         rows = res0.data or []
-        dbg.setdefault("local_calls", []).append({
-            "table": LOCAL_TABLE, "mode": "catalog_no_only", "catno": catno,
-            "rows": len(rows), "ms": int((time.time()-t0)*1000)
-        })
-
-        # 2) label + catalog_no
+        dbg.setdefault("local_calls", []).append({"mode":"catalog_no_only","rows":len(rows)})
         if not rows and label:
-            t1 = time.time()
             res = (sb.table(LOCAL_TABLE)
                      .select("release_id,label,catalog_no,artist,title,discogs_url")
                      .ilike("label", f"%{label.strip()}%")
                      .ilike("catalog_no", norm_catno(catno) or "")
                      .limit(12).execute())
             rows = res.data or []
-            dbg["local_calls"].append({
-                "table": LOCAL_TABLE, "mode": "label+catalog_no",
-                "label": label, "catno": catno, "rows": len(rows), "ms": int((time.time()-t1)*1000)
-            })
-
-        # 3) artist + catalog_no
+            dbg["local_calls"].append({"mode":"label+catalog_no","rows":len(rows)})
         if not rows and artist:
-            t2 = time.time()
             res2 = (sb.table(LOCAL_TABLE)
                       .select("release_id,label,catalog_no,artist,title,discogs_url")
                       .ilike("artist", f"%{artist}%")
                       .ilike("catalog_no", norm_catno(catno) or "")
                       .limit(12).execute())
             rows = res2.data or []
-            dbg["local_calls"].append({
-                "table": LOCAL_TABLE, "mode": "artist+catalog_no",
-                "artist": artist, "catno": catno, "rows": len(rows), "ms": int((time.time()-t2)*1000)
-            })
-
+            dbg["local_calls"].append({"mode":"artist+catalog_no","rows":len(rows)})
         def parse_rid(url: Optional[str]) -> Optional[int]:
             if not url: return None
-            m = re.search(r"/release/(\d+)", url)
+            m = re.search(r"/release/(\\d+)", url)
             return int(m.group(1)) if m else None
-
         for r in rows[:5]:
             rid = r.get("release_id") or parse_rid(r.get("discogs_url"))
             if not rid: continue
@@ -217,16 +251,14 @@ def local_lookup(catno: Optional[str], label: Optional[str], artist: Optional[st
         dbg.setdefault("local_calls", []).append({"error": str(e)})
         return out
 
-# ===================== Discogs structured fallback =====================
+# ----------------- Discogs structured fallback -----------------
 def search_discogs(params: Dict[str, str], dbg: Dict) -> List[IdentifyCandidate]:
     out: List[IdentifyCandidate] = []
-    t0 = time.time()
     r = discogs_request("/database/search", params)
     dbg.setdefault("discogs_calls", []).append({
         "endpoint": "/database/search",
-        "params": {k: v for k, v in params.items() if k != "token"},
+        "params": {k: v for k,v in params.items() if k != "token"},
         "status": r.status_code,
-        "elapsed_ms": int((time.time()-t0)*1000)
     })
     if r.status_code != 200:
         return out
@@ -249,7 +281,7 @@ def search_discogs(params: Dict[str, str], dbg: Dict) -> List[IdentifyCandidate]
         ))
     return out
 
-# ===================== API =====================
+# ----------------- API -----------------
 @router.post("/api/identify", response_model=IdentifyResponse)
 async def identify_api(
     file: UploadFile = File(...),
@@ -260,30 +292,27 @@ async def identify_api(
         t0 = time.time()
         image_bytes = await file.read()
 
-        # 1) Vision Web Detection
+        # Vision
         tv = time.time()
-        v = call_vision_api(image_bytes)
+        resp = call_vision(image_bytes)
         dbg and dbg["steps"].append({"stage":"vision","elapsed_ms": int((time.time()-tv)*1000)})
-        web = v.get("webDetection", {})
-        text = v.get("textAnnotations", [])
-        release_id, master_id, discogs_url, urls = parse_web(web)
+        release_id, master_id, discogs_url, urls = parse_web(resp.get("webDetection", {}))
         if debug:
             dbg["web_urls"] = urls
             dbg["web_release_id"] = release_id
             dbg["web_master_id"]  = master_id
-            dbg["ocr_lines_raw"]  = ocr_lines(text)[:60]
+
+        # OCR lines (merged)
+        lines = ocr_lines(resp)
+        if debug: dbg["ocr_lines_raw"] = lines[:120]
 
         candidates: List[IdentifyCandidate] = []
 
-        # A) Instant hit from image
+        # A) Web detection direct hit
         if release_id:
             tr = time.time()
             rel = discogs_request(f"/releases/{release_id}")
-            dbg and dbg.setdefault("discogs_calls", []).append({
-                "endpoint": f"/releases/{release_id}",
-                "status": rel.status_code,
-                "elapsed_ms": int((time.time()-tr)*1000)
-            })
+            dbg and dbg.setdefault("discogs_calls", []).append({"endpoint": f"/releases/{release_id}", "status": rel.status_code, "elapsed_ms": int((time.time()-tr)*1000)})
             if rel.status_code == 200:
                 js = rel.json()
                 candidates.append(IdentifyCandidate(
@@ -294,135 +323,205 @@ async def identify_api(
                     title=js.get("title"),
                     label=", ".join(l.get("name","") for l in js.get("labels", [])),
                     year=str(js.get("year","")),
-                    cover_url=js.get("thumb") or (js.get("images") or [{}])[0].get("uri", ""),
+                    cover_url=js.get("thumb") or (js.get("images") or [{}])[0].get("uri",""),
                     score=0.90
                 ))
 
         # B) Master only
         if not candidates and master_id:
-            candidates.append(IdentifyCandidate(
-                source="web_detection_master",
-                master_id=master_id,
-                discogs_url=f"https://www.discogs.com/master/{master_id}",
-                note="Master match — user must pick a pressing",
-                score=0.60
-            ))
+            candidates.append(IdentifyCandidate(source="web_detection_master", master_id=master_id, discogs_url=f"https://www.discogs.com/master/{master_id}", note="Master match — user must pick a pressing", score=0.60))
 
-        # C) Text-driven tiers
-        if not candidates:
-            lines = ocr_lines(text)
-            if lines:
-                # Clean OCR text (keep digits/hyphens/slashes for catnos)
-                clean: List[str] = []
-                for ln in lines:
-                    cleaned = re.sub(r"[^\w\s/-]", "", ln).strip()
-                    if cleaned: clean.append(cleaned)
-                if debug: dbg["ocr_lines_clean"] = clean[:60]
+        # C) Text-driven (Google OCR)
+        if not candidates and lines:
+            clean = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
+            if debug: dbg["ocr_lines_clean"] = clean[:120]
 
-                # Extract hints
-                catalog_no_hint = None
-                label_hint = None
-                artist_hint = None
+            # extract hints
+            catalog_no_hint = None
+            label_hint = None
+            artist_hint = None
+            for ln in clean:
+                low = ln.lower()
+                m = re.search(r"[a-z]{2,}\s?-?\s?\d{1,5}", low)
+                if m and not catalog_no_hint:
+                    catalog_no_hint = re.sub(r"\s*-\s*", "-", m.group(0).upper().replace("  "," "))
+                if not label_hint and re.search(r"(records|recordings|music)\b", low):
+                    label_hint = re.sub(r"(records|recordings|music)\b", "", ln, flags=re.I).strip()
+                if not artist_hint:
+                    words = ln.split()
+                    if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
+                        artist_hint = ln.title()
 
-                for ln in clean:
-                    low = ln.lower()
-                    # catno like UR-014 / EVA008 / DECAY 003
-                    m = re.search(r"[a-z]{2,}\s?-?\s?\d{1,5}", low)
-                    if m and not catalog_no_hint:
-                        catalog_no_hint = re.sub(r"\s*-\s*", "-", m.group(0).upper().replace("  "," "))
-                    # label ... Records/Recordings/Music
-                    if not label_hint and re.search(r"(records|recordings|music)\b", low):
-                        label_hint = re.sub(r"(records|recordings|music)\b", "", ln, flags=re.I).strip()
-                    # artist: short ALLCAPS line (<=3 words)
-                    if not artist_hint:
-                        words = ln.split()
-                        if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
-                            artist_hint = ln.title()
-                # small inference: if "evasive" anywhere
-                if not label_hint and any("evasive" in ln.lower() for ln in clean):
-                    label_hint = "Evasive Records"
+            rim_re = re.compile(r"^all rights of the manufacturer", re.I)
+            non_rim = [ln for ln in clean if not rim_re.match(ln)]
+            strong_title = non_rim[0] if non_rim else (clean[0] if clean else "")
 
-                # strong title (avoid sending copyright rim text)
-                copyright_re = re.compile(r"^all rights of the manufacturer", re.I)
-                non_copyright = [ln for ln in clean if not copyright_re.match(ln)]
-                strong_title = non_copyright[0] if non_copyright else (clean[0] if clean else "")
+            signals = {
+                "p_catno": (catalog_no_hint or "").upper().strip(),
+                "p_label": (label_hint or "").strip(),
+                "p_artist": (artist_hint or "").strip(),
+                "p_title": (strong_title or "").strip(),
+            }
+            dbg and dbg.setdefault("extracted", signals)
 
-                # Signals for CSE ranker
-                signals = {
-                    "p_catno": (catalog_no_hint or "").upper().strip(),
-                    "p_label": (label_hint or "").strip(),
-                    "p_artist": (artist_hint or "").strip(),
-                    "p_title": (strong_title or "").strip(),
-                }
+            # 1) Google CSE ranker
+            parts = ["site:discogs.com"]
+            if signals["p_artist"]: parts.append(f"\"{signals['p_artist']}\"")
+            if signals["p_title"]: parts.append(f"\"{signals['p_title']}\"")
+            if signals["p_catno"]: parts.append(signals["p_catno"])
+            g_query = " ".join(parts)
+            dbg and dbg.setdefault("queries_tried", []).append({"google_cse": g_query})
 
-                # Tier 1: Google CSE
-                parts = ["site:discogs.com"]
-                if signals["p_artist"]: parts.append(f"\"{signals['p_artist']}\"")
-                if signals["p_title"]:  parts.append(f"\"{signals['p_title']}\"")
-                if signals["p_catno"]:  parts.append(signals["p_catno"])
-                g_query = " ".join(parts)
-                if debug: dbg["queries_tried"].append({"google_cse": g_query})
-
-                cse_url = google_cse_discogs(g_query, dbg if debug else {}, signals)
-                if cse_url:
-                    m = re.search(r"/release/(\d+)", cse_url)
-                    if m:
-                        rid = int(m.group(1))
-                        rel = discogs_request(f"/releases/{rid}")
-                        artist_str = title_str = label_str = cover = year = None
-                        if rel.status_code == 200:
-                            js = rel.json()
-                            artist_str = ", ".join(a.get("name","") for a in js.get("artists", []))
-                            title_str  = js.get("title")
-                            label_str  = ", ".join(l.get("name","") for l in js.get("labels", []))
-                            cover      = js.get("thumb") or (js.get("images") or [{}])[0].get("uri", "")
-                            year       = str(js.get("year") or "")
-                            dbg and dbg.setdefault("discogs_calls", []).append({
-                                "endpoint": f"/releases/{rid}", "status": 200
-                            })
+            cse_url = google_cse_discogs(g_query, dbg if debug else {}, signals)
+            if cse_url:
+                m = re.search(r"/release/(\\d+)", cse_url)
+                if m:
+                    rid = int(m.group(1))
+                    tr2 = time.time()
+                    rel = discogs_request(f"/releases/{rid}")
+                    dbg and dbg.setdefault("discogs_calls", []).append({"endpoint": f"/releases/{rid}", "status": rel.status_code, "elapsed_ms": int((time.time()-tr2)*1000)})
+                    if rel.status_code == 200:
+                        js = rel.json()
                         candidates.append(IdentifyCandidate(
                             source="google_cse",
                             release_id=rid,
                             discogs_url=cse_url,
-                            artist=artist_str or artist_hint,
-                            title=title_str  or strong_title or None,
-                            label=label_str  or label_hint,
-                            year=year,
-                            cover_url=cover,
+                            artist=", ".join(a.get("name","") for a in js.get("artists", [])),
+                            title=js.get("title"),
+                            label=", ".join(l.get("name","") for l in js.get("labels", [])),
+                            year=str(js.get("year","")),
+                            cover_url=js.get("thumb") or (js.get("images") or [{}])[0].get("uri",""),
                             score=0.88
                         ))
 
-                # Tier 2: Supabase local dump (optional)
-                if not candidates and (catalog_no_hint or label_hint or artist_hint):
-                    local = local_lookup(catalog_no_hint, label_hint, artist_hint, dbg if debug else {})
-                    if local:
-                        candidates.extend(local)
+            # 2) Supabase RPC composite search (if still nothing)
+            if not candidates and (signals["p_catno"] or signals["p_label"] or signals["p_artist"] or signals["p_title"]):
+                rows = rpc_search_records(signals, dbg if debug else {})
+                if rows:
+                    # rows expected to have release_id, title, artist, label, discogs_url, score
+                    for r in rows[:8]:
+                        try:
+                            rid = int(r.get("release_id")) if r.get("release_id") else None
+                        except Exception:
+                            rid = None
+                        disc_url = r.get("discogs_url") or (f"https://www.discogs.com/release/{rid}" if rid else None)
+                        candidates.append(IdentifyCandidate(
+                            source="supabase_rpc",
+                            release_id=rid,
+                            discogs_url=disc_url,
+                            artist=r.get("artist"),
+                            title=r.get("title"),
+                            label=r.get("label"),
+                            year=None,
+                            cover_url=None,
+                            score=float(r.get("score") or 0.75)
+                        ))
 
-                # Tier 3: Discogs structured fallback
-                if not candidates:
-                    attempts: List[Dict[str,str]] = []
-                    ncat = norm_catno(catalog_no_hint) if catalog_no_hint else None
-                    if label_hint and ncat: attempts.append({"label": label_hint, "catno": ncat, "type": "release"})
-                    if artist_hint and ncat: attempts.append({"artist": artist_hint, "catno": ncat, "type": "release"})
-                    if strong_title: attempts.append({"release_title": strong_title, "type": "release"})
-                    # broad q fallbacks
-                    if label_hint and ncat: attempts.append({"q": f"{label_hint} {ncat}", "type":"release"})
-                    if artist_hint and strong_title: attempts.append({"q": f"{artist_hint} {strong_title}", "type":"release"})
-                    if strong_title: attempts.append({"q": strong_title, "type":"release"})
-                    for p in attempts:
-                        res = search_discogs(p, dbg if debug else {})
-                        if res:
-                            for c in res:
-                                if ("label" in p and "catno" in p) or ("artist" in p and "catno" in p):
-                                    c.score = 0.70
-                            candidates.extend(res)
-                            break
+            # 3) Legacy local lookup
+            if not candidates and (signals["p_catno"] or signals["p_label"] or signals["p_artist"]):
+                local = local_lookup(signals["p_catno"], signals["p_label"], signals["p_artist"], dbg if debug else {})
+                if local:
+                    candidates.extend(local)
+
+            # 4) Discogs structured fallback
+            if not candidates:
+                attempts: List[Dict[str,str]] = []
+                ncat = norm_catno(signals["p_catno"]) if signals["p_catno"] else None
+                if signals["p_label"] and ncat: attempts.append({"label": signals["p_label"], "catno": ncat, "type": "release"})
+                if signals["p_artist"] and ncat: attempts.append({"artist": signals["p_artist"], "catno": ncat, "type": "release"})
+                if signals["p_title"]: attempts.append({"release_title": signals["p_title"], "type": "release"})
+                if signals["p_label"] and ncat: attempts.append({"q": f"{signals['p_label']} {ncat}", "type":"release"})
+                if signals["p_artist"] and signals["p_title"]: attempts.append({"q": f"{signals['p_artist']} {signals['p_title']}", "type":"release"})
+                if signals["p_title"]: attempts.append({"q": signals["p_title"], "type":"release"})
+                for p in attempts:
+                    res = search_discogs(p, dbg if debug else {})
+                    if res:
+                        for c in res:
+                            if ("label" in p and "catno" in p) or ("artist" in p and "catno" in p):
+                                c.score = 0.70
+                        candidates.extend(res)
+                        break
 
         # finalize
+        # sort by score desc (highest first)
+        candidates = sorted(candidates, key=lambda c: c.score if c.score is not None else 0.0, reverse=True)
         dbg and dbg.update({"total_elapsed_ms": int((time.time()-t0)*1000)})
-        return IdentifyResponse(candidates=candidates[:10], debug=(dbg or None))
+        return IdentifyResponse(candidates=candidates[:12], debug=(dbg or None))
 
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)[:300])
+
+# ----------------- SUPABASE RPC SQL (run in your Supabase SQL editor) -----------------
+SQL_SNIPPET = r\"\"\"
+-- enable trigram for fuzzy matching
+create extension if not exists pg_trgm;
+
+create index if not exists idx_records_catalog_no_trgm
+  on records using gin (catalog_no gin_trgm_ops);
+create index if not exists idx_records_title_trgm
+  on records using gin (title gin_trgm_ops);
+create index if not exists idx_records_artist_trgm
+  on records using gin (artist gin_trgm_ops);
+create index if not exists idx_records_label_trgm
+  on records using gin (label gin_trgm_ops);
+
+create or replace function search_records(
+  p_catno  text,
+  p_label  text default null,
+  p_artist text default null,
+  p_title  text default null
+)
+returns table (
+  release_id   int,
+  catalog_no   text,
+  label        text,
+  artist       text,
+  title        text,
+  discogs_url  text,
+  score        numeric
+)
+language sql stable as
+$$
+  select set_limit(0.35);
+
+  with tokens as (
+    select
+      upper(coalesce(p_catno, '')) as cat,
+      coalesce(p_label,  '')::text as lbl,
+      coalesce(p_artist, '')::text as art,
+      coalesce(p_title,  '')::text as ttl,
+      case
+        when p_catno ~ '^[A-Za-z]{2,}\\d+$'
+          then upper(regexp_replace(p_catno, '^([A-Za-z]+)(\\d+)$', '\\1%\\2'))
+        else null
+      end as cat_wild
+  )
+  select
+    r.release_id,
+    r.catalog_no,
+    r.label,
+    r.artist,
+    r.title,
+    r.discogs_url,
+    (case when tokens.cat <> '' and upper(r.catalog_no) = tokens.cat then 3.0 else 0 end) +
+    (case when tokens.cat_wild is not null and r.catalog_no ilike tokens.cat_wild then 2.0 else 0 end) +
+    similarity(r.title,  tokens.ttl)  * 1.5 +
+    similarity(r.artist, tokens.art)  * 1.2 +
+    similarity(r.label,  tokens.lbl)  * 1.0
+    as score
+  from records r, tokens
+  where
+    (tokens.cat <> '' and upper(r.catalog_no) = tokens.cat)
+    or (tokens.cat_wild is not null and r.catalog_no ilike tokens.cat_wild)
+    or (tokens.ttl <> '' and r.title  % tokens.ttl)
+    or (tokens.art <> '' and r.artist % tokens.art)
+    or (tokens.lbl <> '' and r.label  % tokens.lbl)
+  order by score desc, release_id
+  limit 20;
+$$;
+\"\"\"
+
+# End of file
+
