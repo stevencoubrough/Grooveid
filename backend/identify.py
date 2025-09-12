@@ -1,3 +1,4 @@
+
 """
 identify.py — GrooveID consolidated resolver
 
@@ -558,24 +559,37 @@ async def identify_api(
                         if not re.search(r"\b(side|volume)\b", ln, re.I):
                             artist_hint = ln.title()
                             break
-                # Tracks: look for A/B prefix or numeric prefix.  Keep only
-                # descriptive titles (not just 'A1' or 'B2').
+                # Tracks: look for lines that define track titles.  We
+                # recognise three patterns:
+                #   1. Side prefixes like "A1." or "B2:" (with optional digit and punctuation).
+                #   2. Numeric prefixes like "1." or "02:".
+                #   3. Colon‑separated lines prefaced with HERE or THERE.  For
+                #      example, "HERE: Tech‑House is Dead." yields the track
+                #      "Tech‑House is Dead.".
                 for ln in clean:
+                    # Skip empty lines
+                    if not ln.strip():
+                        continue
+                    candidate: Optional[str] = None
                     low = ln.lower()
-                    # Remove side/track prefixes
-                    if re.match(r"^[ab][0-9]?[.:]?\s*", low):
-                        track = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
-                    elif re.match(r"^\d+[.:]?\s*", low):
-                        track = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
-                    else:
-                        track = None
-                    if track:
-                        tracks.append(track)
-                # Filter out tracks that are just identifiers (e.g. 'A2')
+                    # 3. Colon separated lines: HERE: Title or THERE: Title
+                    if ":" in ln:
+                        prefix, suffix = ln.split(":", 1)
+                        if prefix.strip().lower() in {"here", "there"} and suffix.strip():
+                            candidate = suffix.strip()
+                    # 1. Side prefixes: A/B with optional number and dot/colon
+                    if candidate is None and re.match(r"^[ab][0-9]?[.:]?\s*", low):
+                        candidate = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
+                    # 2. Numeric prefixes: 1., 01:, etc.
+                    if candidate is None and re.match(r"^\d+[.:]?\s*", low):
+                        candidate = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
+                    if candidate:
+                        tracks.append(candidate)
+                # Filter out tracks that are just identifiers (e.g. 'A2') or too short.
                 filtered_tracks: List[str] = []
                 for ttrack in tracks:
                     words = [w for w in re.split(r"\s+", ttrack) if w]
-                    # Keep if any word has >2 alphabetic characters
+                    # Keep if at least one word has more than two alphabetic characters.
                     keep = any(len(re.sub(r"[^A-Za-z]", "", w)) > 2 for w in words)
                     if keep:
                         filtered_tracks.append(ttrack)
