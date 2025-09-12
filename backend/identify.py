@@ -1,4 +1,3 @@
-"""
 identify.py — GrooveID consolidated resolver
 
 This module exposes a single POST endpoint `/api/identify` for the GrooveID
@@ -218,9 +217,11 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
     """
     Join lines where a track title is broken across multiple OCR lines.  Many
     white‑label scans split track titles over two lines, e.g. "AL. BEHIND" then
-    "THE WHEEL".  We detect a prefix consisting of one or two letters (A/B)
-    followed optionally by a digit and an optional dot.  The prefix may or may
-    not be followed by whitespace because some OCR outputs strip the dot.
+    "THE WHEEL".  We only treat lines that begin with a side/track prefix
+    starting with the letters 'A' or 'B' as candidates for joining.  The
+    prefix may include an optional additional letter or digit (e.g., "AL",
+    "A1", "B2"), an optional dot, and optional whitespace.  Other lines
+    (e.g., "SIDE", "TRON", etc.) should not be modified here.
     """
     result: List[str] = []
     skip = False
@@ -228,17 +229,25 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
         if skip:
             skip = False
             continue
-        # Recognise a prefix like "A1.", "A.", "AL.", "A1", "AL" etc.
-        # Allow optional digit and optional dot and optional whitespace.
-        if re.match(r"^[A-Za-z]{1,2}\d?\.?\s*", ln):
-            # Remove the prefix of letters/digit/dot and any whitespace.
-            title = re.sub(r"^[A-Za-z]{1,2}\d?\.?\s*", "", ln).strip()
-            # If the title is empty and a next line exists, join with it.  This
-            # handles cases where the first line is just a prefix.
-            if i + 1 < len(lines) and lines[i + 1].strip():
+        # Consider prefixes that start with A or B followed by at most one
+        # alphanumeric character and optional dot.  Do not match arbitrary
+        # two-letter prefixes like 'SI' from "SIDE" or 'TR' from "TRON".
+        if re.match(r"^[AB][A-Za-z0-9]?\.?\s*", ln):
+            # Remove the detected prefix and any whitespace following it.
+            title = re.sub(r"^[AB][A-Za-z0-9]?\.?\s*", "", ln).strip()
+            # Join with the next line if the remainder is empty and the next
+            # line exists.  This handles cases where the first line is just
+            # the prefix.
+            if not title and i + 1 < len(lines) and lines[i + 1].strip():
+                title = lines[i + 1].strip()
+                skip = True
+            # If there is non-empty remainder and the next line looks like
+            # part of the title (starts with an uppercase letter or digit),
+            # append it.  This helps join cases like "AL. BEHIND" + "THE WHEEL".
+            elif title and i + 1 < len(lines) and re.match(r"^[A-Za-z0-9]", lines[i + 1]):
                 title = f"{title} {lines[i + 1].strip()}".strip()
                 skip = True
-            result.append(title.strip())
+            result.append(title)
         else:
             result.append(ln)
     return result
@@ -538,12 +547,16 @@ async def identify_api(
                     if re.search(r"(records|recordings|music)\b", ln, re.I):
                         label_hint = re.sub(r"(records|recordings|music)\b", "", ln, flags=re.I).strip()
                         break
-                # Artist: short all‑caps line (<=3 words)
+                # Artist: short all‑caps line (<=3 words) that does not look like a side
+                # marker or volume indicator.  Skip lines containing words such as
+                # "SIDE" or "VOLUME" (case‑insensitive) because these are layout
+                # markers, not artist names.
                 for ln in clean:
                     words = ln.split()
                     if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
-                        artist_hint = ln.title()
-                        break
+                        if not re.search(r"\b(side|volume)\b", ln, re.I):
+                            artist_hint = ln.title()
+                            break
                 # Tracks: look for A/B prefix or numeric prefix.  Keep only
                 # descriptive titles (not just 'A1' or 'B2').
                 for ln in clean:
