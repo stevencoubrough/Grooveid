@@ -685,55 +685,52 @@ async def identify_api(
                     local = local_lookup(catalog_no_hint, label_hint, artist_hint, dbg if debug else {})
                     if local:
                         candidates.extend(local)
-                # Tier 2.5: Broad Google CSE using all OCR tokens.  When the
-                # targeted query and Supabase search both fail, fall back
-                # to querying Google with most of the extracted text.  This
-                # broadens the search by including all meaningful words from
-                # the OCR output (minus generic words like side/volume/etc).
+                # Tier 2.5: Broad Google CSE using the full OCR text truncated
+                # to 1000 characters.  If the targeted query and Supabase
+                # search both fail, fall back to querying Google with nearly
+                # all text extracted from the label.  This broadens the search
+                # without exceeding the Custom Search API query length limit.
                 if not candidates and clean:
-                    # Tokenise all cleaned lines and remove punctuation.  Exclude
-                    # very common tokens such as side, volume, for, promotional,
-                    # use, only, etc., which do not help identify a release.
-                    stop = {"SIDE", "VOLUME", "VOL", "A", "B", "FOR", "PROMOTIONAL", "USE", "ONLY", "PROMO", "THE", "OF", "AND", "#"}
-                    tokens: List[str] = []
-                    for ln in clean:
-                        for word in ln.split():
-                            wc = re.sub(r"[^A-Za-z0-9]", "", word)
-                            if wc and wc.upper() not in stop:
-                                tokens.append(wc)
-                    if tokens:
-                        free_query = "site:discogs.com " + " ".join(tokens)
-                        if debug:
-                            dbg["queries_tried"].append({"google_cse_free_text": free_query})
-                        free_url = google_cse_discogs(free_query, dbg if debug else {}, signals)
-                        if free_url:
-                            m = re.search(r"/release/(\d+)", free_url)
-                            if m:
-                                rid = int(m.group(1))
-                                rel = discogs_request(f"/releases/{rid}")
-                                if debug:
-                                    dbg.setdefault("discogs_calls", []).append({"endpoint": f"/releases/{rid}", "status": rel.status_code})
-                                artist_str = title_str = label_str = cover = year = None
-                                if rel.status_code == 200:
-                                    js = rel.json()
-                                    artist_str = ", ".join(a.get("name", "") for a in js.get("artists", []))
-                                    title_str = js.get("title")
-                                    label_str = ", ".join(l.get("name", "") for l in js.get("labels", []))
-                                    cover = js.get("thumb") or (js.get("images") or [{}])[0].get("uri", "")
-                                    year = str(js.get("year") or "")
-                                candidates.append(
-                                    IdentifyCandidate(
-                                        source="google_cse_free_text",
-                                        release_id=rid,
-                                        discogs_url=free_url,
-                                        artist=artist_str or signals["p_artist"] or None,
-                                        title=title_str or signals["p_title"] or None,
-                                        label=label_str or signals["p_label"] or None,
-                                        year=year,
-                                        cover_url=cover,
-                                        score=0.80,
-                                    )
+                    # Join all cleaned lines into a single string and
+                    # truncate to 1000 characters.  The leading
+                    # "site:discogs.com" portion is not counted in the
+                    # truncation, so the total URL will still be within
+                    # the 2048‑character limit enforced by the API.
+                    full_text = " ".join(clean)
+                    # Truncate to roughly 1000 characters (excluding prefix).
+                    truncated = full_text[:1000]
+                    free_query = f"site:discogs.com {truncated}"
+                    if debug:
+                        dbg["queries_tried"].append({"google_cse_free_text": free_query})
+                    free_url = google_cse_discogs(free_query, dbg if debug else {}, signals)
+                    if free_url:
+                        m = re.search(r"/release/(\d+)", free_url)
+                        if m:
+                            rid = int(m.group(1))
+                            rel = discogs_request(f"/releases/{rid}")
+                            if debug:
+                                dbg.setdefault("discogs_calls", []).append({"endpoint": f"/releases/{rid}", "status": rel.status_code})
+                            artist_str = title_str = label_str = cover = year = None
+                            if rel.status_code == 200:
+                                js = rel.json()
+                                artist_str = ", ".join(a.get("name", "") for a in js.get("artists", []))
+                                title_str = js.get("title")
+                                label_str = ", ".join(l.get("name", "") for l in js.get("labels", []))
+                                cover = js.get("thumb") or (js.get("images") or [{}])[0].get("uri", "")
+                                year = str(js.get("year") or "")
+                            candidates.append(
+                                IdentifyCandidate(
+                                    source="google_cse_free_text",
+                                    release_id=rid,
+                                    discogs_url=free_url,
+                                    artist=artist_str or signals["p_artist"] or None,
+                                    title=title_str or signals["p_title"] or None,
+                                    label=label_str or signals["p_label"] or None,
+                                    year=year,
+                                    cover_url=cover,
+                                    score=0.80,
                                 )
+                            )
                 # Tier 4: Discogs structured fallback
                 if not candidates:
                     attempts: List[Dict[str, str]] = []
