@@ -1,11 +1,11 @@
+"""
+identify.py — GrooveID consolidated resolver
 
-"""identify_with_rpc.py
-
-Drop-in FastAPI module for GrooveID:
-- Google Vision Web Detection + Text/Document OCR (good for graffiti/handwriting)
+Includes:
+- Google Vision Web Detection + Text/Document OCR (handles graffiti/handwriting)
 - Google CSE ranking (site:discogs.com)
-- Supabase RPC fallback: calls `search_records(p_catno, p_label, p_artist, p_title)`
-  (you must create this RPC in your Supabase DB; SQL snippet included below)
+- Supabase RPC fallback: search_records(p_catno, p_label, p_artist, p_title)
+- Legacy Supabase local lookup
 - Discogs structured fallback
 - Debug logging via ?debug=true
 """
@@ -25,7 +25,7 @@ DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN", "").strip()
 GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "").strip()
 GOOGLE_CSE_ID        = os.environ.get("GOOGLE_CSE_ID", "").strip()
 
-# Supabase client (optional)
+# Supabase client (optional but recommended)
 try:
     from supabase import create_client, Client  # type: ignore
     SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -99,12 +99,12 @@ def parse_web(web: dict) -> Tuple[Optional[int], Optional[int], Optional[str], L
     release_id = master_id = None
     discogs_url = None
     for u in urls:
-        m = re.search(r"discogs\\.com/(?:[^/]+/)?release/(\\d+)", u, re.I)
+        m = re.search(r"discogs\.com/(?:[^/]+/)?release/(\d+)", u, re.I)
         if m:
             release_id = int(m.group(1)); discogs_url = u; break
     if not release_id:
         for u in urls:
-            m = re.search(r"discogs\\.com/(?:[^/]+/)?master/(\\d+)", u, re.I)
+            m = re.search(r"discogs\.com/(?:[^/]+/)?master/(\d+)", u, re.I)
             if m:
                 master_id = int(m.group(1)); discogs_url = u; break
     return release_id, master_id, discogs_url, urls
@@ -126,7 +126,7 @@ def merge_google_ocr(resp: dict) -> List[str]:
         if key not in seen:
             seen.add(key)
             out.append(ln)
-    return out[:130]
+    return out[:120]
 
 def ocr_lines(resp: dict) -> List[str]:
     return merge_google_ocr(resp)
@@ -134,8 +134,8 @@ def ocr_lines(resp: dict) -> List[str]:
 def norm_catno(s: Optional[str]) -> Optional[str]:
     if not s: return None
     s = s.upper().strip()
-    s = re.sub(r"\\s*-\\s*", "-", s)
-    s = re.sub(r"\\s+", " ", s)
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = re.sub(r"\s+", " ", s)
     return s
 
 def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, str]) -> Optional[str]:
@@ -178,7 +178,7 @@ def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, str]) -> Option
 def rpc_search_records(signals: Dict[str, str], dbg: Dict) -> List[Dict[str, Any]]:
     """
     Calls Supabase RPC `search_records(p_catno, p_label, p_artist, p_title)`.
-    The RPC should return rows with fields: release_id, catalog_no, label, artist, title, discogs_url, score
+    The RPC should return: release_id, catalog_no, label, artist, title, discogs_url, score
     """
     out: List[Dict[str, Any]] = []
     if not sb:
@@ -186,21 +186,22 @@ def rpc_search_records(signals: Dict[str, str], dbg: Dict) -> List[Dict[str, Any
         return out
     try:
         t0 = time.time()
-        # Note: supabase-py RPC signature expects named args as a dict
         res = sb.rpc("search_records", {
-            "p_catno": signals.get("p_catno") or None,
-            "p_label": signals.get("p_label") or None,
+            "p_catno":  signals.get("p_catno")  or None,
+            "p_label":  signals.get("p_label")  or None,
             "p_artist": signals.get("p_artist") or None,
-            "p_title": signals.get("p_title") or None,
+            "p_title":  signals.get("p_title")  or None,
         }).execute()
         rows = res.data or []
-        dbg.setdefault("local_calls", []).append({"rpc": "search_records", "rows": len(rows), "elapsed_ms": int((time.time()-t0)*1000)})
+        dbg.setdefault("local_calls", []).append({
+            "rpc": "search_records", "rows": len(rows), "elapsed_ms": int((time.time()-t0)*1000)
+        })
         return rows
     except Exception as e:
         dbg.setdefault("local_calls", []).append({"rpc_error": str(e)})
         return out
 
-# ----------------- Local fallback (legacy) -----------------
+# ----------------- Legacy Supabase lookup -----------------
 def local_lookup(catno: Optional[str], label: Optional[str], artist: Optional[str], dbg: Dict) -> List[IdentifyCandidate]:
     out: List[IdentifyCandidate] = []
     if not sb or not catno:
@@ -230,7 +231,7 @@ def local_lookup(catno: Optional[str], label: Optional[str], artist: Optional[st
             dbg["local_calls"].append({"mode":"artist+catalog_no","rows":len(rows)})
         def parse_rid(url: Optional[str]) -> Optional[int]:
             if not url: return None
-            m = re.search(r"/release/(\\d+)", url)
+            m = re.search(r"/release/(\d+)", url)
             return int(m.group(1)) if m else None
         for r in rows[:5]:
             rid = r.get("release_id") or parse_rid(r.get("discogs_url"))
@@ -302,7 +303,7 @@ async def identify_api(
             dbg["web_release_id"] = release_id
             dbg["web_master_id"]  = master_id
 
-        # OCR lines (merged)
+        # OCR
         lines = ocr_lines(resp)
         if debug: dbg["ocr_lines_raw"] = lines[:120]
 
@@ -329,14 +330,19 @@ async def identify_api(
 
         # B) Master only
         if not candidates and master_id:
-            candidates.append(IdentifyCandidate(source="web_detection_master", master_id=master_id, discogs_url=f"https://www.discogs.com/master/{master_id}", note="Master match — user must pick a pressing", score=0.60))
+            candidates.append(IdentifyCandidate(
+                source="web_detection_master",
+                master_id=master_id,
+                discogs_url=f"https://www.discogs.com/master/{master_id}",
+                note="Master match — user must pick a pressing",
+                score=0.60
+            ))
 
-        # C) Text-driven (Google OCR)
+        # C) Text-driven (Google OCR → CSE → Supabase RPC → legacy → Discogs)
         if not candidates and lines:
             clean = [re.sub(r"[^\w\s/-]", "", ln).strip() for ln in lines if ln.strip()]
             if debug: dbg["ocr_lines_clean"] = clean[:120]
 
-            # extract hints
             catalog_no_hint = None
             label_hint = None
             artist_hint = None
@@ -364,17 +370,17 @@ async def identify_api(
             }
             dbg and dbg.setdefault("extracted", signals)
 
-            # 1) Google CSE ranker
+            # 1) Google CSE
             parts = ["site:discogs.com"]
             if signals["p_artist"]: parts.append(f"\"{signals['p_artist']}\"")
-            if signals["p_title"]: parts.append(f"\"{signals['p_title']}\"")
-            if signals["p_catno"]: parts.append(signals["p_catno"])
+            if signals["p_title"]:  parts.append(f"\"{signals['p_title']}\"")
+            if signals["p_catno"]:  parts.append(signals["p_catno"])
             g_query = " ".join(parts)
             dbg and dbg.setdefault("queries_tried", []).append({"google_cse": g_query})
 
             cse_url = google_cse_discogs(g_query, dbg if debug else {}, signals)
             if cse_url:
-                m = re.search(r"/release/(\\d+)", cse_url)
+                m = re.search(r"/release/(\d+)", cse_url)
                 if m:
                     rid = int(m.group(1))
                     tr2 = time.time()
@@ -394,11 +400,10 @@ async def identify_api(
                             score=0.88
                         ))
 
-            # 2) Supabase RPC composite search (if still nothing)
+            # 2) Supabase RPC composite search
             if not candidates and (signals["p_catno"] or signals["p_label"] or signals["p_artist"] or signals["p_title"]):
                 rows = rpc_search_records(signals, dbg if debug else {})
                 if rows:
-                    # rows expected to have release_id, title, artist, label, discogs_url, score
                     for r in rows[:8]:
                         try:
                             rid = int(r.get("release_id")) if r.get("release_id") else None
@@ -443,7 +448,6 @@ async def identify_api(
                         break
 
         # finalize
-        # sort by score desc (highest first)
         candidates = sorted(candidates, key=lambda c: c.score if c.score is not None else 0.0, reverse=True)
         dbg and dbg.update({"total_elapsed_ms": int((time.time()-t0)*1000)})
         return IdentifyResponse(candidates=candidates[:12], debug=(dbg or None))
@@ -453,9 +457,8 @@ async def identify_api(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)[:300])
 
-# ----------------- SUPABASE RPC SQL (run in your Supabase SQL editor) -----------------
-SQL_SNIPPET = r\"\"\"
--- enable trigram for fuzzy matching
+# ----------------- SUPABASE RPC SQL (run once in Supabase SQL editor) -----------------
+SQL_SNIPPET = r"""
 create extension if not exists pg_trgm;
 
 create index if not exists idx_records_catalog_no_trgm
@@ -493,8 +496,8 @@ $$
       coalesce(p_artist, '')::text as art,
       coalesce(p_title,  '')::text as ttl,
       case
-        when p_catno ~ '^[A-Za-z]{2,}\\d+$'
-          then upper(regexp_replace(p_catno, '^([A-Za-z]+)(\\d+)$', '\\1%\\2'))
+        when p_catno ~ '^[A-Za-z]{2,}\d+$'
+          then upper(regexp_replace(p_catno, '^([A-Za-z]+)(\d+)$', '\1%\2'))
         else null
       end as cat_wild
   )
@@ -521,7 +524,4 @@ $$
   order by score desc, release_id
   limit 20;
 $$;
-\"\"\"
-
-# End of file
-
+"""
