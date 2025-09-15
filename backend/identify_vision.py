@@ -344,6 +344,56 @@ def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, Any]) -> Option
 
 
 # ---------- SUPABASE RPC ----------
+
+# ---- Search-everything helpers ----
+STOPWORDS = {
+    "deluxe","gatefold","pressed","vinyl","parental","explicit","lyrics",
+    "blue","red","limited","edition","lp","ep","12","7","10","booklet","sticker","bonus","download","digital"
+}
+CATNO_PATTERNS = [
+    r"[A-Z]{2,}\s?-?\s?\d{2,}", r"\d{3,}-\d{1,}", r"[A-Z]{2,}\d{2,}", r"[A-Z]+-\d+"
+]
+
+def _normalize_lines_for_chunks(lines: List[str]) -> List[str]:
+    toks = []
+    for ln in lines:
+        ln = ln.strip().lower()
+        ln = re.sub(r"[^\w\s\-&:/\.]", " ", ln)
+        ln = re.sub(r"\s+", " ", ln)
+        if ln:
+            toks.append(ln)
+    return toks
+
+def _extract_catnos_from_blob(text: str) -> List[str]:
+    catnos = set()
+    up = text.upper()
+    for pat in CATNO_PATTERNS:
+        for m in re.findall(pat, up):
+            catnos.add(m.replace(" ", ""))
+    return list(catnos)
+
+def build_search_everything_queries(clean_lines: List[str]) -> Tuple[List[str], str, List[str]]:
+    toks = _normalize_lines_for_chunks(clean_lines)
+    raw_blob = " ".join(toks)
+    words = [w for w in raw_blob.split() if w not in STOPWORDS]
+    chunks: List[str] = []
+    for n in range(7, 3, -1):  # 7→4
+        step = max(1, n-3)
+        for i in range(0, max(0, len(words)-n+1), step):
+            chunk = " ".join(words[i:i+n])
+            if len(chunk) > 12:
+                chunks.append(chunk)
+        if len(chunks) >= 6:
+            break
+    catnos = _extract_catnos_from_blob(raw_blob)
+    queries = []
+    if raw_blob:
+        queries.append(f"{raw_blob} site:discogs.com")
+    queries += [f"{c} site:discogs.com" for c in chunks[:6]]
+    queries += [f"\"{c}\" site:discogs.com" for c in catnos]
+    return queries, raw_blob, catnos
+
+
 def rpc_search_records(signals: Dict[str, Any], dbg: Dict) -> List[Dict[str, Any]]:
     """Call Supabase RPC search_records with extracted signals."""
     out: List[Dict[str, Any]] = []
@@ -810,6 +860,50 @@ async def identify_api(
                                     score=0.80,
                                 )
                             )
+
+                # Tier 3b: Search-everything n-grams & catnos
+                if not candidates:
+                    try:
+                        queries, raw_blob, catnos = build_search_everything_queries(clean)
+                        if debug:
+                            dbg["queries_tried"].append({"google_cse_chunks": queries[:6]})
+                        for q in queries:
+                            cu = google_cse_discogs(q, dbg if debug else {}, signals)
+                            if not cu:
+                                continue
+                            mm = re.search(r"/release/(\d+)", cu)
+                            if not mm:
+                                continue
+                            rid2 = int(mm.group(1))
+                            rel2 = discogs_request(f"/releases/{rid2}")
+                            if debug:
+                                dbg.setdefault("discogs_calls", []).append({"endpoint": f"/releases/{rid2}", "status": rel2.status_code})
+                            artist_str = title_str = label_str = cover = year = None
+                            if rel2.status_code == 200:
+                                js2 = rel2.json()
+                                artist_str = ", ".join(a.get("name","") for a in js2.get("artists", []))
+                                title_str = js2.get("title")
+                                label_str = ", ".join(l.get("name","") for l in js2.get("labels", []))
+                                cover = js2.get("thumb") or (js2.get("images") or [{}])[0].get("uri", "")
+                                year = str(js2.get("year") or "")
+                            candidates.append(
+                                IdentifyCandidate(
+                                    source="google_cse_chunks",
+                                    release_id=rid2,
+                                    discogs_url=cu,
+                                    artist=artist_str or signals.get("p_artist") or None,
+                                    title=title_str or signals.get("p_title") or None,
+                                    label=label_str or signals.get("p_label") or None,
+                                    year=year,
+                                    cover_url=cover,
+                                    score=0.82,
+                                )
+                            )
+                            break  # first good hit wins
+                    except Exception as _e:
+                        if debug:
+                            dbg.setdefault("errors", []).append({"chunks": str(_e)})
+
                 # Tier 4: Discogs structured fallback
                 if not candidates:
                     attempts: List[Dict[str, str]] = []
