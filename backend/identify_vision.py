@@ -217,15 +217,12 @@ RIM_PREFIX_RE = re.compile(r"^all rights of the manufacturer", re.I)
 def join_broken_tracks(lines: List[str]) -> List[str]:
     """
     Join lines where a track title is broken across multiple OCR lines.  Many
-    white‑label scans split track titles over two lines, e.g. ``"A1. BEHIND"``
-    then ``"THE WHEEL"``.  We only treat lines that begin with a side/track
-    prefix starting with the letters ``A`` or ``B`` followed by at most one
-    *digit* and optional punctuation (``.``, ``:``) as candidates for joining.
-
-    This avoids matching arbitrary two‑letter words beginning with ``B`` (such
-    as ``"BEST"``), which previously caused characters to be stripped from
-    legitimate track names.  Other lines (e.g. ``"SIDE"``, ``"TRON"``,
-    ``"PROMO"``) are left untouched.
+    white‑label scans split track titles over two lines, e.g. "AL. BEHIND" then
+    "THE WHEEL".  We only treat lines that begin with a side/track prefix
+    starting with the letters 'A' or 'B' as candidates for joining.  The
+    prefix may include an optional additional letter or digit (e.g., "AL",
+    "A1", "B2"), an optional dot, and optional whitespace.  Other lines
+    (e.g., "SIDE", "TRON", etc.) should not be modified here.
     """
     result: List[str] = []
     skip = False
@@ -233,18 +230,21 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
         if skip:
             skip = False
             continue
-        # Match side/track prefixes: A or B followed by an optional digit,
-        # optional dot or colon, and whitespace.  Do NOT match words that
-        # begin with A or B followed by a letter (e.g. "BEST").
-        if re.match(r"^[AB]\d?[.:]?\s*", ln):
-            title = re.sub(r"^[AB]\d?[.:]?\s*", "", ln).strip()
-            # If the remainder is empty, take the next non-empty line as the title.
+        # Consider prefixes that start with A or B followed by at most one
+        # alphanumeric character and optional dot.  Do not match arbitrary
+        # two-letter prefixes like 'SI' from "SIDE" or 'TR' from "TRON".
+        if re.match(r"^[AB][A-Za-z0-9]?\.?\s*", ln):
+            # Remove the detected prefix and any whitespace following it.
+            title = re.sub(r"^[AB][A-Za-z0-9]?\.?\s*", "", ln).strip()
+            # Join with the next line if the remainder is empty and the next
+            # line exists.  This handles cases where the first line is just
+            # the prefix.
             if not title and i + 1 < len(lines) and lines[i + 1].strip():
                 title = lines[i + 1].strip()
                 skip = True
-            # If there is a remainder and the next line looks like a continuation
-            # (starts with a letter or digit), append it.  This helps join
-            # cases like "A1. BEHIND" + "THE WHEEL".
+            # If there is non-empty remainder and the next line looks like
+            # part of the title (starts with an uppercase letter or digit),
+            # append it.  This helps join cases like "AL. BEHIND" + "THE WHEEL".
             elif title and i + 1 < len(lines) and re.match(r"^[A-Za-z0-9]", lines[i + 1]):
                 title = f"{title} {lines[i + 1].strip()}".strip()
                 skip = True
@@ -252,40 +252,6 @@ def join_broken_tracks(lines: List[str]) -> List[str]:
         else:
             result.append(ln)
     return result
-
-# NEW: combine consecutive uppercase lines into a single line.  Some white‑label
-# scans split an artist or track name over two lines, e.g. ``"ZUKI"`` and
-# ``"MO"`` on separate lines.  This function merges adjacent lines when
-# each line consists solely of uppercase words (ignoring non‑alphabetic
-# characters) and has no digits.  It prevents broken artist names from
-# being misinterpreted as separate signals.
-def combine_upper_lines(lines: List[str]) -> List[str]:
-    combined: List[str] = []
-    skip = False
-    for i, ln in enumerate(lines):
-        if skip:
-            skip = False
-            continue
-        # Determine if this line is composed of uppercase words (no digits)
-        words = ln.split()
-        is_upper = bool(words) and all(
-            (w.isalpha() and w.isupper()) or (re.sub(r"[^A-Za-z]", "", w).isupper() and re.search(r"[A-Za-z]", w))
-            for w in words
-        )
-        # Only join if the current and next lines are uppercase and contain no digits
-        if is_upper and i + 1 < len(lines):
-            next_ln = lines[i + 1]
-            next_words = next_ln.split()
-            is_upper_next = bool(next_words) and all(
-                (w.isalpha() and w.isupper()) or (re.sub(r"[^A-Za-z]", "", w).isupper() and re.search(r"[A-Za-z]", w))
-                for w in next_words
-            )
-            if is_upper_next:
-                combined.append(f"{ln.strip()} {next_ln.strip()}")
-                skip = True
-                continue
-        combined.append(ln)
-    return combined
 
 
 def google_cse_discogs(query: str, dbg: Dict, signals: Dict[str, Any]) -> Optional[str]:
@@ -560,10 +526,8 @@ async def identify_api(
                     cleaned = re.sub(r"[^\w\s./:-]", "", ln).strip()
                     if cleaned:
                         clean.append(cleaned)
-                # Join broken track names (e.g. "A1. BEHIND" + "THE WHEEL")
+                # Join broken track names
                 clean = join_broken_tracks(clean)
-                # Join consecutive uppercase lines (e.g. "ZUKI" + "MO" → "ZUKI MO")
-                clean = combine_upper_lines(clean)
                 if debug:
                     dbg["ocr_lines_clean"] = clean[:200]
                 # Extract signals
@@ -584,70 +548,40 @@ async def identify_api(
                     if re.search(r"(records|recordings|music)\b", ln, re.I):
                         label_hint = re.sub(r"(records|recordings|music)\b", "", ln, flags=re.I).strip()
                         break
-                # Artist: find an uppercase line that looks like a name.  We
-                # require the line to contain at least two words OR a single
-                # word longer than three letters, and all alphabetic characters
-                # must be uppercase.  Skip common layout markers like "SIDE"
-                # or "VOLUME" and discard one‑letter lines such as "R".
+                # Artist: short all‑caps line (<=3 words) that does not look like a side
+                # marker or volume indicator.  Skip lines containing words such as
+                # "SIDE" or "VOLUME" (case‑insensitive) because these are layout
+                # markers, not artist names.
                 for ln in clean:
                     words = ln.split()
-                    # Skip if the line contains side or volume markers.
-                    if re.search(r"\b(side|volume)\b", ln, re.I):
-                        continue
-                    # Determine if the line is fully uppercase (ignoring non‑alpha characters).
-                    if words:
-                        if len(words) >= 2 or (len(words) == 1 and len(re.sub(r"[^A-Za-z]", "", words[0])) > 3):
-                            if all(w.isalpha() and w.isupper() for w in words):
-                                artist_hint = ln.title()
-                                break
-                # Tracks: extract all plausible track titles.  We
-                # recognise several patterns:
-                #   1. Colon‑separated lines prefaced with HERE or THERE: e.g.
-                #      "HERE: Tech‑House is Dead." → "Tech‑House is Dead."
-                #   2. Side prefixes like "A1.", "B2:" (with optional digit and punctuation).
-                #   3. Numeric prefixes like "1." or "02:".
-                #   4. Multi‑word uppercase lines (e.g. "NINA KRAVIZ", "BEST FRIEND",
-                #      "DVS1 DUB TEST FEAT.", "NAUGHTY WOOD").  We treat these as
-                #      track candidates so they contribute to the Google query.
+                    if 1 <= len(words) <= 3 and all(w.isalpha() and w.isupper() for w in words):
+                        if not re.search(r"\b(side|volume)\b", ln, re.I):
+                            artist_hint = ln.title()
+                            break
+                # Tracks: look for lines that define track titles.  We
+                # recognise three patterns:
+                #   1. Side prefixes like "A1." or "B2:" (with optional digit and punctuation).
+                #   2. Numeric prefixes like "1." or "02:".
+                #   3. Colon‑separated lines prefaced with HERE or THERE.  For
+                #      example, "HERE: Tech‑House is Dead." yields the track
+                #      "Tech‑House is Dead.".
                 for ln in clean:
+                    # Skip empty lines
                     if not ln.strip():
                         continue
                     candidate: Optional[str] = None
                     low = ln.lower()
-                    # Pattern 1: HERE/THERE prefixes
+                    # 3. Colon separated lines: HERE: Title or THERE: Title
                     if ":" in ln:
                         prefix, suffix = ln.split(":", 1)
                         if prefix.strip().lower() in {"here", "there"} and suffix.strip():
                             candidate = suffix.strip()
-                    # Pattern 2: A/B side prefixes
+                    # 1. Side prefixes: A/B with optional number and dot/colon
                     if candidate is None and re.match(r"^[ab][0-9]?[.:]?\s*", low):
-                        # Only extract if there is a remainder after the prefix
-                        remainder = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
-                        if remainder:
-                            candidate = remainder
-                    # Pattern 3: Numeric prefixes
+                        candidate = re.sub(r"^[ab][0-9]?[.:]?\s*", "", ln).strip()
+                    # 2. Numeric prefixes: 1., 01:, etc.
                     if candidate is None and re.match(r"^\d+[.:]?\s*", low):
-                        remainder = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
-                        if remainder:
-                            candidate = remainder
-                    # Pattern 4: colon‑separated remix lines like "re‑mixed by Mark Kamins" or "remix by"
-                    if candidate is None and re.search(r"re[- ]?mix(ed)?", low) and "by" in low:
-                        # Extract portion after 'by'
-                        parts = re.split(r"\bby\b", ln, maxsplit=1, flags=re.I)
-                        if len(parts) == 2:
-                            suffix = parts[1].strip()
-                            if suffix:
-                                candidate = suffix
-                    # Pattern 5: Multi‑word uppercase lines (two or more words)
-                    if candidate is None:
-                        words = ln.split()
-                        # At least two words and not a website/URL (ignore lines containing dots or www)
-                        if (
-                            len(words) >= 2
-                            and all(re.search(r"[A-Z]", w) for w in words)
-                            and not re.match(r"^www|http", ln.lower())
-                        ):
-                            candidate = ln.strip()
+                        candidate = re.sub(r"^\d+[.:]?\s*", "", ln).strip()
                     if candidate:
                         tracks.append(candidate)
                 # Filter out tracks that are just identifiers (e.g. 'A2') or too short.
@@ -856,132 +790,4 @@ async def identify_api(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)[:300])t APIRouter, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import os, base64, requests, re
-from supabase import create_client
-
-VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
-VISION_KEY = os.environ.get("GOOGLE_VISION_API_KEY")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-
-RE_RELEASE = re.compile(r"discogs\.com/(?:[^/]+/)?release/(\d+)", re.IGNORECASE)
-RE_MASTER = re.compile(r"discogs\.com/(?:[^/]+/)?master/(\d+)", re.IGNORECASE)
-
-class IdentifyCandidate(BaseModel):
-    source: str
-    release_id: Optional[int] = None
-    master_id: Optional[int] = None
-    discogs_url: Optional[str] = None
-    artist: Optional[str] = None
-    title: Optional[str] = None
-    label: Optional[str] = None
-    year: Optional[str] = None
-    cover_url: Optional[str] = None
-    score: float
-    note: Optional[str] = None
-
-class IdentifyResponse(BaseModel):
-    candidates: List[IdentifyCandidate]
-
-router = APIRouter()
-
-@router.post("/identify_vision", response_model=IdentifyResponse)
-async def identify_vision(image: UploadFile = File(...)):
-    content = await image.read()
-    if not VISION_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY is not configured")
-    b64 = base64.b64encode(content).decode("utf-8")
-    payload = {
-        "requests": [{
-            "image": {"content": b64},
-            "features": [
-                {"type": "WEB_DETECTION", "maxResults": 10},
-                {"type": "TEXT_DETECTION", "maxResults": 5}
-            ],
-            "imageContext": {"webDetectionParams": {"includeGeoResults": True}}
-        }]
-    }
-    resp = requests.post(f"{VISION_ENDPOINT}?key={VISION_KEY}", json=payload, timeout=30)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Vision API error {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()["responses"][0]
-    web = data.get("webDetection", {})
-    text_ann = data.get("textAnnotations", [])
-    urls = []
-    for key in ("pagesWithMatchingImages","fullMatchingImages","partialMatchingImages","visuallySimilarImages"):
-        for item in web.get(key, []):
-            u = item.get("url")
-            if u:
-                urls.append(u)
-    release_id = None
-    discogs_url = None
-    for u in urls:
-        m = RE_RELEASE.search(u)
-        if m:
-            release_id = int(m.group(1))
-            discogs_url = u
-            break
-    candidates: List[IdentifyCandidate] = []
-    # If release id found, fetch from cache or discogs
-    if release_id:
-        row = None
-        if supabase:
-            result = supabase.table("discogs_cache").select("*").eq("release_id", release_id).limit(1).execute()
-            row = result.data[0] if result.data else None
-        if row:
-            candidates.append(IdentifyCandidate(source="web_cache", release_id=release_id, discogs_url=row["discogs_url"], artist=row["artist"], title=row["title"], label=row["label"], year=row["year"], cover_url=row["cover_url"], score=0.95))
-        else:
-            headers = {"User-Agent": "GrooveID/1.0 (+https://grooveid.app)"}
-            r = requests.get(f"https://api.discogs.com/releases/{release_id}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                js = r.json()
-                row = {
-                    "release_id": release_id,
-                    "discogs_url": discogs_url or js.get("uri") or f"https://www.discogs.com/release/{release_id}",
-                    "artist": ", ".join([a.get("name","") for a in js.get("artists", [])]),
-                    "title": js.get("title"),
-                    "label": ", ".join([l.get("name","") for l in js.get("labels", [])]),
-                    "year": str(js.get("year") or ""),
-                    "cover_url": js.get("thumb") or (js.get("images", [{}])[0].get("uri") if js.get("images") else None),
-                    "payload": js
-                }
-                if supabase:
-                    supabase.table("discogs_cache").upsert(row, on_conflict="release_id").execute()
-                candidates.append(IdentifyCandidate(source="web_live", release_id=release_id, discogs_url=row["discogs_url"], artist=row["artist"], title=row["title"], label=row["label"], year=row["year"], cover_url=row["cover_url"], score=0.9))
-    # Fallback: use OCR text to search discogs
-    if not candidates and text_ann:
-        query = " ".join([ln.strip() for ln in text_ann[0].get("description", "").splitlines() if ln.strip()])[:200]
-        headers = {"User-Agent": "GrooveID/1.0 (+https://grooveid.app)"}
-        s = requests.get("https://api.discogs.com/database/search", params={"q": query, "type": "release"}, headers=headers, timeout=15)
-        if s.status_code == 200:
-            js = s.json()
-            for it in js.get("results", [])[:5]:
-                url = it.get("resource_url", "")
-                if "/releases/" in url:
-                    rid = int(url.rstrip("/").split("/")[-1])
-                    artist_field = None
-                    if " - " in it.get("title", ""):
-                        artist_field = it.get("title", "").split(" - ")[0]
-                    label_field = None
-                    lbl = it.get("label")
-                    if isinstance(lbl, list) and lbl:
-                        label_field = lbl[0]
-                    elif isinstance(lbl, str):
-                        label_field = lbl
-                    candidates.append(IdentifyCandidate(
-                        source="ocr_search",
-                        release_id=rid,
-                        discogs_url=f"https://www.discogs.com/release/{rid}",
-                        artist=artist_field,
-                        title=it.get("title"),
-                        label=label_field,
-                        year=str(it.get("year") or ""),
-                        cover_url=it.get("thumb"),
-                        score=0.65
-                    ))
-    return IdentifyResponse(candidates=candidates[:5])
+        raise HTTPException(status_code=500, detail=str(exc)[:300])
