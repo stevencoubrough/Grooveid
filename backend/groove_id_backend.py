@@ -6,7 +6,7 @@ import sys
 # ensure parent directory is in sys.path so `backend` package is importable
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.identify import router as identify_router
+from backend.identify_vision import router as identify_router
 from backend.discogs_auth import router as discogs_auth_router
 from backend.collection import router as collection_router
 
